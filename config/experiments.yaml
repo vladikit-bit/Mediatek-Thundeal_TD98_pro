@@ -1,0 +1,48 @@
+# Experiment Configuration
+# Default parameters and overrides for each experiment
+
+experiments:
+  # Phase 2 dummy experiments for infrastructure validation
+  - id: exp00_dummy
+    module: mtklab.experiments.exp00_dummy.exp00_dummy.Exp00Dummy
+    display_name: "Dummy Experiment (Infrastructure Test)"
+    description: "No-op experiment to verify CLI → Registry → Context → DB pipeline"
+    version: "1.0.0"
+    requires: []
+    parameters:
+      sleep_seconds: 0.1
+      create_finding: true
+
+  - id: exp01_entropy_landscape
+    module: mtklab.experiments.exp01_entropy_landscape.exp01_entropy_landscape.Exp01EntropyLandscape
+    display_name: "Entropy Landscape (Macro)"
+    description: "Shannon entropy scan of REE payload with 4KB windows to identify region boundaries"
+    version: "1.0.0"
+    requires: []
+    parameters:
+      window_size: 4096
+      step_size: 4096
+      thresholds:
+        empty: 1.0
+        structured: 3.5
+        code: 5.5
+        compressed: 7.0
+      output_regions_csv: true
+      output_sparkline: true
+
+  - id: exp02_repeated_structures
+    module: mtklab.experiments.exp02_repeated_structures.exp02_repeated_structures.Exp02RepeatedStructures
+    display_name: "Repeated Structure Detector"
+    description: "Scans low-entropy regions for fixed-size record arrays (partition tables, cert chains)"
+    version: "1.0.0"
+    requires: [exp01_entropy_landscape]
+    parameters:
+      record_sizes: [16, 24, 32, 40, 48, 56, 64, 80, 96, 128, 192, 256, 384, 512, 768, 1024]
+      min_consistency: 0.7
+      min_records: 3
+      search_in_regions: "low_entropy"  # Uses exp01 output via shared_data
+
+# Default parameters applied to all experiments unless overridden
+defaults:
+  progress_interval: 1000
+  max_artifacts_mb: 100

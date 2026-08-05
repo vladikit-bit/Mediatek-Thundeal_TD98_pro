@@ -1,0 +1,339 @@
+"""MT5889 RE Laboratory - Command Line Interface."""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import click
+import yaml
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+
+from mtklab.core.experiment import ExperimentRegistry, ExperimentContext
+from mtklab.core.evidence import EvidenceEngine
+from mtklab.core.project import Project
+from mtklab.storage.db import EvidenceDatabase
+
+console = Console()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("mtklab.cli")
+
+
+def get_project(name: str) -> Project:
+    """Load a project by name."""
+    return Project(name, Path("data/projects"))
+
+
+def get_registry(project: Project) -> ExperimentRegistry:
+    """Build the experiment registry from config."""
+    registry = ExperimentRegistry()
+    # Auto-discover experiments from the package
+    count = registry.auto_discover("mtklab.experiments")
+    logger.info(f"Discovered {count} experiments")
+    
+    # Apply config overrides
+    config_path = Path("config/experiments.yaml")
+    if config_path.exists():
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        for exp_cfg in config.get("experiments", []):
+            exp_id = exp_cfg["id"]
+            if exp_id in registry._experiments:
+                exp = registry._experiments[exp_id]
+                exp.requires = exp_cfg.get("requires", exp.requires)
+                exp.parameters = {**exp.parameters, **exp_cfg.get("parameters", {})}
+    
+    return registry
+
+
+@click.group()
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def cli(verbose: bool):
+    """MT5889 Reverse Engineering Laboratory for Thundeal TD98 Pro."""
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+
+@cli.command()
+@click.argument("name")
+@click.option("--firmware", "-f", type=click.Path(exists=True), help="Path to OTA firmware file")
+@click.option("--ree-payload", "-r", type=click.Path(exists=True), help="Path to REE payload (optional)")
+@click.option("--force", is_flag=True, help="Overwrite existing project")
+def init_project(name: str, firmware: Optional[str], ree_payload: Optional[str], force: bool):
+    """Initialize a new firmware analysis project."""
+    project_dir = Path("data/projects") / name
+    
+    if project_dir.exists():
+        if force:
+            console.print(f"[yellow]Project '{name}' exists, overwriting...[/yellow]")
+            shutil.rmtree(project_dir)
+        else:
+            console.print(f"[red]Project '{name}' already exists. Use --force to overwrite.[/red]")
+            sys.exit(1)
+    
+    # Create project structure
+    project_dir.mkdir(parents=True)
+    (project_dir / "firmware").mkdir(parents=True)
+    
+    # Copy/symlink firmware files
+    firmware_dst = project_dir / "firmware" / "upgrade_image.pkg"
+    if firmware:
+        shutil.copy2(firmware, firmware_dst)
+        console.print(f"Copied firmware: {firmware} → {firmware_dst}")
+    else:
+        console.print("[yellow]No firmware provided. Place upgrade_image.pkg in data/projects/{name}/firmware/[/yellow]")
+    
+    ree_dst = project_dir / "firmware" / "ree_payload.bin"
+    if ree_payload:
+        shutil.copy2(ree_payload, ree_dst)
+        console.print(f"Copied REE payload: {ree_payload} → {ree_dst}")
+    else:
+        console.print("[yellow]No REE payload provided. Place ree_payload.bin in data/projects/{name}/firmware/[/yellow]")
+    
+    # Create config.yaml
+    config = {
+        "firmware": {
+            "name": "Thundeal TD98 Pro",
+            "soc": "MT5889",
+            "os": "Android TV 10",
+            "files": {
+                "ota": str(firmware_dst.relative_to(project_dir)) if firmware_dst.exists() else "firmware/upgrade_image.pkg",
+                "ree_payload": str(ree_dst.relative_to(project_dir)) if ree_dst.exists() else "firmware/ree_payload.bin",
+            }
+        }
+    }
+    config_path = project_dir / "config.yaml"
+    config_path.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
+    
+    console.print(Panel.fit(
+        f"[green]Project '{name}' initialized successfully![/green]\n\n"
+        f"Directory: {project_dir}\n"
+        f"Config: {config_path}\n\n"
+        f"Next steps:\n"
+        f"  mtklab run --project {name} --all\n"
+        f"  mtklab list-experiments --project {name}",
+        title="Project Created",
+        border_style="green"
+    ))
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="Project name")
+@click.argument("experiment_ids", nargs=-1)
+@click.option("--all", "run_all", is_flag=True, help="Run all discovered experiments")
+@click.option("--dry-run", is_flag=True, help="Show execution order without running")
+def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
+    """Run experiments in dependency order."""
+    proj = get_project(project)
+    registry = get_registry(proj)
+    
+    # Determine target experiments
+    if run_all:
+        targets = list(registry._experiments.keys())
+    elif experiment_ids:
+        targets = list(experiment_ids)
+    else:
+        console.print("[red]No experiments specified. Use --all or provide experiment IDs.[/red]")
+        sys.exit(1)
+    
+    # Validate targets exist
+    for tid in targets:
+        if tid not in registry._experiments:
+            console.print(f"[red]Experiment '{tid}' not found.[/red]")
+            sys.exit(1)
+    
+    # Resolve execution order
+    try:
+        order = registry.resolve_order(targets)
+    except ValueError as e:
+        console.print(f"[red]Dependency error: {e}[/red]")
+        sys.exit(1)
+    
+    console.print(Panel.fit(
+        f"[bold]Execution Order ({len(order)} experiments)[/bold]\n" +
+        "\n".join(f"  {i+1}. {eid}" for i, eid in enumerate(order)),
+        title=f"Project: {project}",
+        border_style="blue"
+    ))
+    
+    if dry_run:
+        console.print("[yellow]Dry run - not executing.[/yellow]")
+        return
+    
+    # Execute experiments
+    engine = EvidenceEngine(proj.db)
+    
+    for i, exp_id in enumerate(order):
+        exp = registry._experiments[exp_id]
+        console.print(f"\n[cyan][{i+1}/{len(order)}] Running {exp_id}...[/cyan]")
+        
+        try:
+            # Prepare context with dependencies
+            ctx = registry.prepare_context(exp_id, proj.create_experiment_context(exp_id))
+            
+            # Run experiment
+            result = exp.run(ctx)
+            result.mark_completed()
+            
+            # Submit findings through Evidence Engine
+            if result.findings or result.evidences or result.hypotheses:
+                for finding in result.findings:
+                    finding.experiment_id = exp_id
+                    engine.submit_finding(finding, result.evidences)
+                for hyp in result.hypotheses:
+                    hyp.hypothesis_id = hyp.hypothesis_id  # ensure set
+                    proj.db.store_hypothesis(hyp)
+            
+            # Store experiment result
+            proj.db.store_experiment_result(result)
+            
+            # Store artifacts
+            for artifact_type, path in result.artifacts.items():
+                proj.db.store_artifact_reference(exp_id, artifact_type, path, f"Artifact from {exp_id}")
+            
+            console.print(f"  [green]✓ {exp_id}[/green] - {result.status}: {result.summary}")
+            
+        except Exception as e:
+            logger.exception(f"Experiment {exp_id} failed")
+            console.print(f"  [red]✗ {exp_id}[/red] - failed: {e}")
+            # Store failed result
+            from mtklab.core.experiment import ExperimentResult
+            failed_result = ExperimentResult(
+                experiment_id=exp_id,
+                status="failed",
+                summary=str(e),
+                errors=[str(e)],
+            )
+            failed_result.mark_completed()
+            proj.db.store_experiment_result(failed_result)
+    
+    console.print("\n[bold green]All experiments completed.[/bold green]")
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="Project name")
+def list_experiments(project: str):
+    """List all discovered experiments with their dependencies."""
+    proj = get_project(project)
+    registry = get_registry(proj)
+    
+    table = Table(title=f"Experiments in Project '{project}'")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Version", style="dim")
+    table.add_column("Requires", style="yellow")
+    table.add_column("Description", style="dim")
+    
+    for exp in registry.all():
+        table.add_row(
+            exp.experiment_id,
+            exp.display_name,
+            exp.version,
+            ", ".join(exp.requires) if exp.requires else "—",
+            exp.description[:60] + "..." if len(exp.description) > 60 else exp.description
+        )
+    
+    console.print(table)
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="Project name")
+@click.argument("experiment_id")
+def inspect(project: str, experiment_id: str):
+    """Show detailed JSON for an experiment result."""
+    proj = get_project(project)
+    
+    # Get experiment result from DB
+    cursor = proj.db._conn.execute(
+        "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+    )
+    row = cursor.fetchone()
+    
+    if not row:
+        console.print(f"[red]Experiment '{experiment_id}' not found in project '{project}'.[/red]")
+        sys.exit(1)
+    
+    from mtklab.utils import json as json_utils
+    result = {
+        "experiment_id": row["experiment_id"],
+        "display_name": row["display_name"],
+        "version": row["version"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "summary": row["summary"],
+        "parameters": json_utils.loads(row["parameters_json"]),
+        "metadata": json_utils.loads(row["metadata_json"]),
+        "errors": json_utils.loads(row["errors_json"]),
+    }
+    
+    # Get findings
+    cursor = proj.db._conn.execute(
+        "SELECT finding_id FROM findings WHERE experiment_id = ?", (experiment_id,)
+    )
+    findings = []
+    for frow in cursor.fetchall():
+        finding = proj.db.get_finding(frow["finding_id"])
+        if finding:
+            findings.append(finding.to_dict())
+    
+    result["findings"] = findings
+    
+    console.print(json_utils.dumps(result, indent=2))
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="Project name")
+@click.option("--output", "-o", type=click.Path(), help="Output HTML path")
+def report(project: str, output: Optional[str]):
+    """Generate HTML dashboard report."""
+    raise NotImplementedError("HTML report generation will be implemented in Phase 4")
+
+
+@cli.command()
+@click.option("--project", "-p", required=True, help="Project name")
+def status(project: str):
+    """Show project status summary."""
+    proj = get_project(project)
+    
+    # Experiment counts
+    cursor = proj.db._conn.execute("SELECT status, COUNT(*) as cnt FROM experiments GROUP BY status")
+    exp_stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
+    
+    # Finding counts
+    cursor = proj.db._conn.execute("SELECT confidence, COUNT(*) as cnt FROM findings GROUP BY confidence")
+    find_stats = {row["confidence"]: row["cnt"] for row in cursor.fetchall()}
+    
+    # Hypothesis counts
+    cursor = proj.db._conn.execute("SELECT status, COUNT(*) as cnt FROM hypotheses GROUP BY status")
+    hyp_stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
+    
+    console.print(Panel.fit(
+        f"[bold]Project:[/bold] {project}\n"
+        f"[bold]Directory:[/bold] {proj.project_dir}\n"
+        f"[bold]Firmware:[/bold] {proj.get_firmware_path()}\n"
+        f"[bold]REE Payload:[/bold] {proj.get_ree_payload_path()}\n\n"
+        f"[bold]Experiments:[/bold] {sum(exp_stats.values())} total\n"
+        + "\n".join(f"  {k}: {v}" for k, v in exp_stats.items()) + "\n\n"
+        f"[bold]Findings:[/bold] {sum(find_stats.values())} total\n"
+        + "\n".join(f"  {k}: {v}" for k, v in find_stats.items()) + "\n\n"
+        f"[bold]Hypotheses:[/bold] {sum(hyp_stats.values())} total\n"
+        + "\n".join(f"  {k}: {v}" for k, v in hyp_stats.items()),
+        title="Project Status",
+        border_style="green"
+    ))
+
+
+if __name__ == "__main__":
+    cli()

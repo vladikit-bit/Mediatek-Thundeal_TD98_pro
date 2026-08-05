@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtklab"
+version = "0.1.0"
+description = "MT5889 Reverse Engineering Laboratory for Thundeal TD98 Pro"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.entry-points]
+console_scripts = [
+    "mtklab = mtklab.cli:cli",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mtklab*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

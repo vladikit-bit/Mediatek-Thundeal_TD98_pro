@@ -1,0 +1,52 @@
+# MT5889 Firmware Configuration
+# Thundeal TD98 Pro - MediaTek MT5889 - Android TV 10
+
+firmware:
+  name: "Thundeal TD98 Pro"
+  soc: "MT5889"
+  os: "Android TV 10"
+  description: "OTA firmware for Thundeal TD98 Pro TV box"
+
+  # Firmware file paths (relative to project root or absolute)
+  files:
+    ota: "data/firmware/upgrade_image.pkg"
+    ree_payload: "data/firmware/ree_payload.bin"
+
+  # Known structures from manual analysis
+  known_structures:
+    - offset: 0x0
+      size: 256
+      type: "crypto_header"
+      description: "160 bytes high entropy + 96 zeros - likely RSA signature"
+      confidence: "high"
+
+    - offset: 0x100
+      size: 512
+      type: "padding"
+      description: "Zero padding region"
+      confidence: "high"
+
+    - offset: 0x300
+      size: 256
+      type: "text_header"
+      description: "REE_OFFSET_START=0x1000, REE_OFFSET_LEN=0x5AEB0000"
+      confidence: "high"
+
+    - offset: 0x500
+      size: 512
+      type: "mtk_binary_header"
+      description: "MTK......` + partition/load info (0x6009, 0x100000, 0x5AEB0000 visible)"
+      confidence: "high"
+
+    - offset: 0x1000
+      size: 0x5AEB0000
+      type: "ree_payload"
+      description: "Main REE region (extracted to ree_payload.bin)"
+      confidence: "high"
+
+  # Hints for experiments
+  hints:
+    ree_offset: 0x1000
+    ree_length: 0x5AEB0000
+    mtk_header_offset: 0x500
+    text_header_offset: 0x300
