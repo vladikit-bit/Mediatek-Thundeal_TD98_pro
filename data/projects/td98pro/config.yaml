@@ -1,0 +1,7 @@
+firmware:
+  files:
+    ota: firmware\upgrade_image.pkg
+    ree_payload: firmware\ree_payload.bin
+  name: Thundeal TD98 Pro
+  os: Android TV 10
+  soc: MT5889

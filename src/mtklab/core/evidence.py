@@ -176,6 +176,23 @@ class Finding:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+    def add_version(self, reason: str = "") -> dict[str, Any]:
+        """Add a new version snapshot to the version history.
+
+        Creates a snapshot of the current finding state and appends it to
+        ``self.versions`` with a monotonically increasing version number
+        (derived from ``len(self.versions) + 1``).
+
+        Args:
+            reason: Human-readable reason for the version change.
+
+        Returns:
+            The created version snapshot dictionary.
+        """
+        snapshot = self._create_version_snapshot(reason)
+        self.versions.append(snapshot)
+        return snapshot
+
     def add_evidence(self, evidence_id: str, evidence_engine: "EvidenceEngine" = None):
         """Add supporting evidence and recalculate confidence."""
         if evidence_id not in self.evidence_ids:
@@ -249,25 +266,98 @@ class EvidenceEngine:
     def __init__(self, db: "EvidenceDatabase"):
         self.db = db
 
-    def submit_finding(self, finding: Finding, evidences: list[Evidence]) -> Finding:
-        """Register finding + evidence, upgrade confidence if warranted."""
-        # Store evidences
-        for ev in evidences:
-            self.db.store_evidence(ev)
-            if ev.evidence_id not in finding.evidence_ids:
-                finding.evidence_ids.append(ev.evidence_id)
+    def submit_finding(self, finding: Finding, evidences: list[Evidence] | None = None) -> Finding:
+        """Register finding + evidence with logical_id deduplication and versioning.
 
-        # Determine confidence from evidence
-        finding.confidence = self._calculate_confidence(evidences)
-        finding.versions.append(finding._create_version_snapshot("initial_submission"))
+        Workflow per DOMAIN_API.md §4 (Finding Lifecycle & submit_finding() Flow):
+        1. **Logical ID Verification**: Generate logical_id if missing.
+        2. **Evidence Storage**: Persist evidence records (dedup via INSERT OR IGNORE).
+        3. **Finding Lookup**: Query database for existing finding by logical_id.
+        4. **State Comparison**:
+           - Content Unchanged → return existing finding (no new DB record).
+           - Content Modified → new finding_id UUID, increment version.
+           - New Finding → version 1 from __post_init__.
+        5. **Persist** finding and update related hypotheses.
 
-        # Store finding
+        Args:
+            finding: The Finding to register.
+            evidences: Optional list of Evidence objects supporting the finding.
+
+        Returns:
+            The Finding as stored, or the existing Finding if unchanged.
+        """
+        # 1. Verify/generate logical_id
+        if not finding.logical_id:
+            finding.logical_id = generate_logical_id(
+                finding.experiment_id, str(finding.kind), finding.offset, finding.size
+            )
+
+        # 2. Store evidence and calculate confidence
+        if evidences:
+            for ev in evidences:
+                self.db.store_evidence(ev)
+                if ev.evidence_id not in finding.evidence_ids:
+                    finding.evidence_ids.append(ev.evidence_id)
+            finding.confidence = self._calculate_confidence(evidences)
+
+        # 3. Lookup existing finding by logical_id
+        existing = self.db.get_latest_finding_by_logical_id(finding.logical_id)
+
+        # 4. Deduplication and versioning
+        if existing:
+            if self._is_finding_unchanged(existing, finding):
+                # Content unchanged — return existing finding without new DB record
+                return existing
+            # Content modified — generate new finding_id and add version snapshot
+            finding.finding_id = str(uuid.uuid4())
+            # Inherit version history from existing finding for continuity
+            finding.versions = list(existing.versions)
+            finding.add_version("updated")
+        else:
+            # New finding — __post_init__ already created version 1 ("created")
+            # Add submission snapshot to capture post-evidence confidence state
+            finding.add_version("initial_submission")
+
+        # 5. Store finding and update hypotheses
         self.db.store_finding(finding)
-
-        # Check for related hypotheses
         self._update_hypotheses(finding)
 
         return finding
+
+    def _is_finding_unchanged(self, existing: Finding, incoming: Finding) -> bool:
+        """Check if an existing finding is unchanged from the incoming one.
+
+        Compares the four content fields (confidence, label, description,
+        metadata) per DOMAIN_API.md §4.  If all match, the finding is
+        considered identical and no new version is needed.
+
+        Args:
+            existing: The finding retrieved from the database.
+            incoming: The finding currently being submitted.
+
+        Returns:
+            True if all compared fields match exactly.
+        """
+        return (
+            existing.confidence == incoming.confidence
+            and existing.label == incoming.label
+            and existing.description == incoming.description
+            and existing.metadata == incoming.metadata
+        )
+
+    def _get_latest_version_num(self, finding: Finding) -> int:
+        """Extract the highest version number from a finding's version history.
+
+        Args:
+            finding: A Finding object with a populated ``versions`` list.
+
+        Returns:
+            The version number from the last entry in the versions list,
+            or 1 if the list is empty or the last entry lacks a version key.
+        """
+        if finding.versions:
+            return finding.versions[-1].get("version", 1)
+        return 1
 
     def _calculate_confidence(self, evidences: list[Evidence]) -> ConfidenceLevel:
         """Upgrade logic based on evidence diversity and strength."""
