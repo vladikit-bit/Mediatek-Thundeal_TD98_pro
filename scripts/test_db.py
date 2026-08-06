@@ -19,10 +19,15 @@ def main():
     # Check migrations applied
     cursor = proj.db._conn.execute("SELECT version FROM schema_migrations")
     versions = [r[0] for r in cursor.fetchall()]
-    assert versions == [1], f"Expected version [1], got {versions}"
+    assert versions == [1, 2], f"Expected version [1, 2], got {versions}"
     print(" - Migrations applied successfully.")
 
     print("2. Testing Evidence API...")
+    from mtklab.core.experiment import ExperimentResult
+    res = ExperimentResult(experiment_id="exp_test", status="success", summary="Test experiment")
+    res.mark_completed()
+    proj.db.store_experiment_result(res)
+
     ev = Evidence(
         experiment_id="exp_test",
         evidence_type=EvidenceType.SIGNATURE_MATCH,

@@ -145,7 +145,7 @@ class Exp01EntropyLandscape(Experiment):
         # Full entropy points JSON
         points_path = ctx.artifacts_dir / "entropy_points.json"
         points_path.write_text(
-            __import__("json").dumps([{"offset": p.offset, "size": p.size, "entropy": p.entropy} for p in points]),
+            __import__("json").dumps([{"offset": p.offset, "size": getattr(p, "size", config.window), "entropy": p.entropy} for p in points]),
             encoding="utf-8"
         )
         artifacts["entropy_points_json"] = points_path

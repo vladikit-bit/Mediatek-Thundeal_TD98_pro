@@ -1,8 +1,14 @@
 """Project / Firmware Session management."""
 
-import yaml
 from pathlib import Path
 from typing import Any, Dict
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
 
 from mtklab.core.experiment import ExperimentContext
 from mtklab.storage.artifacts import ArtifactManager
@@ -33,7 +39,14 @@ class Project:
         self.config_path = self.project_dir / "config.yaml"
         self.config: Dict[str, Any] = {}
         if self.config_path.exists():
-            self.config = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+            if YAML_AVAILABLE and yaml is not None:
+                self.config = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+            else:
+                import json
+                try:
+                    self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    self.config = {}
             
         # Initialize subsystem managers
         self.artifacts = ArtifactManager(self.project_dir)
@@ -54,7 +67,8 @@ class Project:
         """Get the main firmware path from config or defaults."""
         fw_path = self.config.get("firmware", {}).get("files", {}).get("ota")
         if fw_path:
-            return Path(fw_path)
+            p = Path(fw_path)
+            return p if p.is_absolute() else self.project_dir / p
         # Default assumption if not configured
         return self.project_dir / "firmware" / "upgrade_image.pkg"
 
@@ -62,7 +76,8 @@ class Project:
         """Get the REE payload path from config or defaults."""
         ree_path = self.config.get("firmware", {}).get("files", {}).get("ree_payload")
         if ree_path:
-            return Path(ree_path)
+            p = Path(ree_path)
+            return p if p.is_absolute() else self.project_dir / p
         return self.project_dir / "firmware" / "ree_payload.bin"
 
     def create_experiment_context(self, experiment_id: str) -> ExperimentContext:

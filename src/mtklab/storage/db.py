@@ -37,6 +37,7 @@ class EvidenceDatabase:
         self.db_path = db_path
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA foreign_keys = ON;")
         
         # Apply migrations
         migrator = MigrationManager(self._conn, migrations_dir)
@@ -58,7 +59,7 @@ class EvidenceDatabase:
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """
-                INSERT INTO evidences (
+                INSERT OR IGNORE INTO evidences (
                     evidence_id, experiment_id, evidence_type, confidence, 
                     description, data_json, source_offset, source_size, 
                     tags_json, timestamp
@@ -112,11 +113,11 @@ class EvidenceDatabase:
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """
-                INSERT INTO findings (
+                INSERT OR IGNORE INTO findings (
                     finding_id, experiment_id, kind, offset, size, 
                     confidence, label, description, evidence_ids_json, 
-                    metadata_json, versions_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_json, versions_json, logical_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     finding.finding_id,
@@ -130,6 +131,7 @@ class EvidenceDatabase:
                     json.dumps(finding.evidence_ids),
                     json.dumps(finding.metadata),
                     json.dumps(finding.versions),
+                    finding.logical_id,
                 )
             )
 
@@ -155,16 +157,17 @@ class EvidenceDatabase:
                 )
             )
 
-    def get_finding(self, finding_id: str) -> Optional[Finding]:
-        """Retrieve a finding by ID."""
-        cursor = self._conn.execute(
-            "SELECT * FROM findings WHERE finding_id = ?", 
-            (str(finding_id),)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-            
+    def _row_to_finding(self, row: sqlite3.Row) -> Finding:
+        """Convert a database row into a Finding object.
+
+        ``logical_id`` and ``versions`` are assigned after construction so that
+        Finding.__post_init__'s logical_id auto-generation (MTKLAB-002) never
+        fires here.  A row's logical_id column is the source of truth for what
+        was actually persisted/indexed; rows written before migration 002 (or
+        before MTKLAB-002 shipped) legitimately have NULL, and the caller must
+        reflect that exactly rather than fabricate a value that was never stored
+        or deduplicated on.
+        """
         finding = Finding(
             finding_id=row["finding_id"],
             experiment_id=row["experiment_id"],
@@ -177,8 +180,56 @@ class EvidenceDatabase:
             evidence_ids=json.loads(row["evidence_ids_json"]),
             metadata=json.loads(row["metadata_json"]),
         )
+        finding.logical_id = row["logical_id"] if "logical_id" in row.keys() else None
         finding.versions = json.loads(row["versions_json"])
         return finding
+
+    def get_finding(self, finding_id: str) -> Optional[Finding]:
+        """Retrieve a finding by ID."""
+        cursor = self._conn.execute(
+            "SELECT * FROM findings WHERE finding_id = ?",
+            (str(finding_id),)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_finding(row)
+
+    def get_latest_finding_by_logical_id(self, logical_id: str) -> Optional[Finding]:
+        """Retrieve the highest-version finding for a given ``logical_id``.
+
+        Multiple rows in the ``findings`` table can share the same
+        ``logical_id`` (each representing a version snapshot with its own
+        ``finding_id`` UUID).  This method returns the row whose latest
+        version number — parsed from the ``versions_json`` column — is the
+        greatest.
+
+        Returns ``None`` when no finding with the given ``logical_id``
+        exists (including rows where ``logical_id`` is NULL).
+        """
+        cursor = self._conn.execute(
+            "SELECT * FROM findings WHERE logical_id = ?",
+            (logical_id,)
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        def _latest_version(row: sqlite3.Row) -> int:
+            """Extract the highest version number from a row's versions_json."""
+            try:
+                versions = json.loads(row["versions_json"])
+            except (json.JSONDecodeError, TypeError):
+                # Unparseable or missing versions_json: default to version 1
+                # per MTKLAB-003 edge-case specification.
+                return 1
+            if versions:
+                return versions[-1].get("version", 1)
+            # Empty versions array: default to version 1
+            return 1
+
+        latest_row = max(rows, key=_latest_version)
+        return self._row_to_finding(latest_row)
 
     # --- Hypothesis Operations ---
 
@@ -191,7 +242,7 @@ class EvidenceDatabase:
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """
-                INSERT INTO hypotheses (
+                INSERT OR IGNORE INTO hypotheses (
                     hypothesis_id, subject_offset, subject_size, claim, 
                     alternative_claims_json, status, supporting_evidence_json, 
                     contradicting_evidence_json, resolved_claim, resolution_reason, 

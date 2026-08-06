@@ -111,6 +111,32 @@ class Evidence:
         )
 
 
+def generate_logical_id(
+    experiment_id: str, kind: str, offset: int | None, size: int | None
+) -> str:
+    """Generate the canonical ``logical_id`` string for a Finding.
+
+    Format: ``<experiment_id>:<kind>:0x<offset>-0x<end_offset>`` with offsets
+    zero-padded to 8 hex digits, or ``<experiment_id>:<kind>:global`` when
+    ``offset`` or ``size`` is unknown.
+
+    See DOMAIN_API.md section 3.2 ("Canonical Format") for the specification.
+
+    Args:
+        experiment_id: Owning experiment identifier (e.g. "exp01_entropy_landscape").
+        kind: Finding kind as a string (e.g. "region", "header").
+        offset: Start offset in the binary, or None if not region-scoped.
+        size: Size in bytes, or None if not region-scoped.
+
+    Returns:
+        A deterministic, human-readable logical_id string.
+    """
+    if offset is None or size is None:
+        return f"{experiment_id}:{kind}:global"
+    end_offset = offset + size
+    return f"{experiment_id}:{kind}:0x{offset:08x}-0x{end_offset:08x}"
+
+
 @dataclass
 class Finding:
     """A structural finding in the firmware (region, object, table, etc.)."""
@@ -125,11 +151,16 @@ class Finding:
     description: str = ""
     evidence_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    logical_id: str | None = None
 
     # Versioned history - first-class feature
     versions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
+        if self.logical_id is None:
+            self.logical_id = generate_logical_id(
+                self.experiment_id, str(self.kind), self.offset, self.size
+            )
         if not self.versions:
             self.versions.append(self._create_version_snapshot("created"))
 
@@ -180,6 +211,7 @@ class Finding:
             "description": self.description,
             "evidence_ids": self.evidence_ids,
             "metadata": self.metadata,
+            "logical_id": self.logical_id,
             "versions": self.versions,
         }
 
@@ -197,6 +229,13 @@ class Finding:
             evidence_ids=d.get("evidence_ids", []),
             metadata=d.get("metadata", {}),
         )
+        # Deserialization restores exactly what was persisted, including a
+        # missing/None logical_id for pre-MTKLAB-002 records. It must NOT go
+        # through the __post_init__ auto-generation path, or legacy records
+        # would silently acquire a fabricated logical_id that was never
+        # actually indexed/deduplicated on. See MTKLAB-001 edge cases and
+        # REVIEW_GUIDELINES.md 2.3 ("maintain default fallbacks for missing keys").
+        f.logical_id = d.get("logical_id")
         f.versions = d.get("versions", [])
         return f
 

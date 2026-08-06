@@ -17,8 +17,76 @@ try:
     MSTAR_AVAILABLE = True
 except ImportError:
     MSTAR_AVAILABLE = False
-    # Stub types for type hints
-    class EntropyPoint: pass
+
+    @dataclass
+    class EntropyPoint:
+        offset: int
+        entropy: float
+
+    def shannon_entropy(data: bytes) -> float:
+        import math
+        from collections import Counter
+        if not data:
+            return 0.0
+        length = len(data)
+        counts = Counter(data)
+        entropy = 0.0
+        for count in counts.values():
+            p = count / length
+            entropy -= p * math.log2(p)
+        return entropy
+
+    def classify_region(entropy: float) -> str:
+        if entropy < 1.0:
+            return "zero/padding"
+        elif entropy < 5.0:
+            return "low_entropy/code"
+        elif entropy < 7.2:
+            return "medium_entropy/data"
+        else:
+            return "high_entropy/compressed_or_encrypted"
+
+    def scan_entropy(data: bytes, window: int = 4096, step: Optional[int] = None) -> list[EntropyPoint]:
+        step = step or window
+        points = []
+        for offset in range(0, len(data), step):
+            chunk = data[offset:offset + window]
+            if not chunk:
+                break
+            e = shannon_entropy(chunk)
+            points.append(EntropyPoint(offset=offset, entropy=e))
+        return points
+
+    def high_entropy_regions(points: list[EntropyPoint], threshold: float = 7.2) -> list[tuple[int, int]]:
+        regions = []
+        in_region = False
+        start = 0
+        end = 0
+        for p in points:
+            if p.entropy >= threshold:
+                if not in_region:
+                    in_region = True
+                    start = p.offset
+                end = p.offset + 4096
+            else:
+                if in_region:
+                    regions.append((start, end))
+                    in_region = False
+        if in_region:
+            regions.append((start, end))
+        return regions
+
+    def sparkline(points: list[EntropyPoint], width: int = 120) -> str:
+        if not points:
+            return ""
+        ticks = " ▂▃▄▅▆▇█"
+        step = max(1, len(points) // width)
+        sampled = [points[i].entropy for i in range(0, len(points), step)][:width]
+        res = []
+        for val in sampled:
+            idx = min(7, max(0, int((val / 8.0) * 8)))
+            res.append(ticks[idx])
+        return "".join(res)
 
 
 @dataclass
@@ -32,8 +100,6 @@ class MStarEntropyAdapter:
     """Adapts MStar entropy module to Evidence Engine format."""
     
     def __init__(self, config: Optional[EntropyScanConfig] = None):
-        if not MSTAR_AVAILABLE:
-            raise RuntimeError("mstar_analyzer not available. Install the MStar analyzer package.")
         self.config = config or EntropyScanConfig()
     
     def scan(self, data: bytes, experiment_id: str) -> tuple[list[EntropyPoint], list[Evidence]]:

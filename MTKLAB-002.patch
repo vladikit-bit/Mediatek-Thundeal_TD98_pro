@@ -1,0 +1,241 @@
+diff --git a/src/mtklab/core/__init__.py b/src/mtklab/core/__init__.py
+index 490dbbb..58a87f6 100644
+--- a/src/mtklab/core/__init__.py
++++ b/src/mtklab/core/__init__.py
+@@ -13,6 +13,7 @@ from .evidence import (
+     Finding,
+     FindingKind,
+     EvidenceEngine,
++    generate_logical_id,
+ )
+ from .hypothesis import Hypothesis, HypothesisStatus
+ from .project import Project
+@@ -28,6 +29,7 @@ __all__ = [
+     "Finding",
+     "FindingKind",
+     "EvidenceEngine",
++    "generate_logical_id",
+     "Hypothesis",
+     "HypothesisStatus",
+     "Project",
+diff --git a/src/mtklab/core/evidence.py b/src/mtklab/core/evidence.py
+index c078028..3f45b47 100644
+--- a/src/mtklab/core/evidence.py
++++ b/src/mtklab/core/evidence.py
+@@ -111,6 +111,32 @@ class Evidence:
+         )
+ 
+ 
++def generate_logical_id(
++    experiment_id: str, kind: str, offset: int | None, size: int | None
++) -> str:
++    """Generate the canonical ``logical_id`` string for a Finding.
++
++    Format: ``<experiment_id>:<kind>:0x<offset>-0x<end_offset>`` with offsets
++    zero-padded to 8 hex digits, or ``<experiment_id>:<kind>:global`` when
++    ``offset`` or ``size`` is unknown.
++
++    See DOMAIN_API.md section 3.2 ("Canonical Format") for the specification.
++
++    Args:
++        experiment_id: Owning experiment identifier (e.g. "exp01_entropy_landscape").
++        kind: Finding kind as a string (e.g. "region", "header").
++        offset: Start offset in the binary, or None if not region-scoped.
++        size: Size in bytes, or None if not region-scoped.
++
++    Returns:
++        A deterministic, human-readable logical_id string.
++    """
++    if offset is None or size is None:
++        return f"{experiment_id}:{kind}:global"
++    end_offset = offset + size
++    return f"{experiment_id}:{kind}:0x{offset:08x}-0x{end_offset:08x}"
++
++
+ @dataclass
+ class Finding:
+     """A structural finding in the firmware (region, object, table, etc.)."""
+@@ -131,6 +157,10 @@ class Finding:
+     versions: list[dict[str, Any]] = field(default_factory=list)
+ 
+     def __post_init__(self):
++        if self.logical_id is None:
++            self.logical_id = generate_logical_id(
++                self.experiment_id, str(self.kind), self.offset, self.size
++            )
+         if not self.versions:
+             self.versions.append(self._create_version_snapshot("created"))
+ 
+@@ -198,8 +228,14 @@ class Finding:
+             description=d.get("description", ""),
+             evidence_ids=d.get("evidence_ids", []),
+             metadata=d.get("metadata", {}),
+-            logical_id=d.get("logical_id"),
+         )
++        # Deserialization restores exactly what was persisted, including a
++        # missing/None logical_id for pre-MTKLAB-002 records. It must NOT go
++        # through the __post_init__ auto-generation path, or legacy records
++        # would silently acquire a fabricated logical_id that was never
++        # actually indexed/deduplicated on. See MTKLAB-001 edge cases and
++        # REVIEW_GUIDELINES.md 2.3 ("maintain default fallbacks for missing keys").
++        f.logical_id = d.get("logical_id")
+         f.versions = d.get("versions", [])
+         return f
+ 
+diff --git a/src/mtklab/storage/db.py b/src/mtklab/storage/db.py
+index 850e2f0..02699bc 100644
+--- a/src/mtklab/storage/db.py
++++ b/src/mtklab/storage/db.py
+@@ -178,8 +178,15 @@ class EvidenceDatabase:
+             description=row["description"],
+             evidence_ids=json.loads(row["evidence_ids_json"]),
+             metadata=json.loads(row["metadata_json"]),
+-            logical_id=row["logical_id"] if "logical_id" in row.keys() else None,
+         )
++        # Assigned after construction (not passed to Finding(...)) so that
++        # Finding.__post_init__'s logical_id auto-generation (MTKLAB-002)
++        # never fires here. A row's logical_id column is the source of
++        # truth for what was actually persisted/indexed; rows written before
++        # migration 002 (or before MTKLAB-002 shipped) legitimately have
++        # NULL, and get_finding() must reflect that exactly rather than
++        # fabricate a value that was never stored or deduplicated on.
++        finding.logical_id = row["logical_id"] if "logical_id" in row.keys() else None
+         finding.versions = json.loads(row["versions_json"])
+         return finding
+ 
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+index 4b29014..8fd2881 100644
+--- a/tests/test_evidence.py
++++ b/tests/test_evidence.py
+@@ -1,13 +1,18 @@
+ """Unit tests for Evidence and Finding domain models."""
+ 
+ import unittest
+-from mtklab.core.evidence import Finding, FindingKind, ConfidenceLevel
++from mtklab.core.evidence import Finding, FindingKind, ConfidenceLevel, generate_logical_id
+ 
+ 
+ class TestFindingSerialization(unittest.TestCase):
+     """Test Finding dataclass serialization and deserialization."""
+ 
+-    def test_finding_to_dict_and_from_dict_without_logical_id(self):
++    def test_finding_auto_generates_logical_id_when_omitted(self):
++        """Since MTKLAB-002, a Finding constructed without logical_id gets a
++        canonical one auto-generated from experiment_id/kind/offset/size
++        (DOMAIN_API.md 3.1: Finding auto-population via generate_logical_id).
++        This supersedes the pre-MTKLAB-002 expectation that omitting
++        logical_id left it None (see MTKLAB-002.md section 6)."""
+         finding = Finding(
+             experiment_id="exp01",
+             kind=FindingKind.REGION,
+@@ -17,11 +22,12 @@ class TestFindingSerialization(unittest.TestCase):
+             label="Header",
+             description="Test region finding",
+         )
+-        self.assertIsNone(finding.logical_id)
++        expected = generate_logical_id("exp01", "region", 1024, 2048)
++        self.assertEqual(finding.logical_id, expected)
++        self.assertEqual(finding.logical_id, "exp01:region:0x00000400-0x00000c00")
+ 
+         d = finding.to_dict()
+-        self.assertIn("logical_id", d)
+-        self.assertIsNone(d["logical_id"])
++        self.assertEqual(d["logical_id"], expected)
+ 
+         reconstructed = Finding.from_dict(d)
+         self.assertEqual(reconstructed.finding_id, finding.finding_id)
+@@ -32,7 +38,20 @@ class TestFindingSerialization(unittest.TestCase):
+         self.assertEqual(reconstructed.confidence, ConfidenceLevel.CANDIDATE)
+         self.assertEqual(reconstructed.label, "Header")
+         self.assertEqual(reconstructed.description, "Test region finding")
+-        self.assertIsNone(reconstructed.logical_id)
++        self.assertEqual(reconstructed.logical_id, expected)
++
++    def test_finding_auto_generates_global_logical_id_without_offset_or_size(self):
++        """A Finding with no meaningful offset/size (e.g. size=None) falls
++        back to the ':global' suffix rather than a fabricated range."""
++        finding = Finding(
++            experiment_id="exp01",
++            kind=FindingKind.UNKNOWN,
++            offset=0,
++            size=None,
++            confidence=ConfidenceLevel.CANDIDATE,
++            description="No concrete region",
++        )
++        self.assertEqual(finding.logical_id, "exp01:unknown:global")
+ 
+     def test_finding_to_dict_and_from_dict_with_logical_id(self):
+         logical_id = "exp01:region:0x00000400-0x00000c00"
+@@ -74,5 +93,43 @@ class TestFindingSerialization(unittest.TestCase):
+         self.assertEqual(reconstructed.finding_id, "test-uuid-1234")
+ 
+ 
++class TestGenerateLogicalId(unittest.TestCase):
++    """Unit tests for the standalone generate_logical_id() helper (MTKLAB-002)."""
++
++    def test_valid_offset_and_size(self):
++        result = generate_logical_id("exp01_entropy_landscape", "region", 0, 0x8000)
++        self.assertEqual(result, "exp01_entropy_landscape:region:0x00000000-0x00008000")
++
++    def test_zero_padding_format(self):
++        result = generate_logical_id("exp01", "header", 1024, 2048)
++        self.assertEqual(result, "exp01:header:0x00000400-0x00000c00")
++
++    def test_offset_none_falls_back_to_global(self):
++        result = generate_logical_id("exp01", "region", None, 0x8000)
++        self.assertEqual(result, "exp01:region:global")
++
++    def test_size_none_falls_back_to_global(self):
++        result = generate_logical_id("exp01", "region", 0, None)
++        self.assertEqual(result, "exp01:region:global")
++
++    def test_both_none_falls_back_to_global(self):
++        result = generate_logical_id("exp01", "region", None, None)
++        self.assertEqual(result, "exp01:region:global")
++
++    def test_large_offset_beyond_32_bit(self):
++        offset = 0x1_0000_0000  # > 32-bit
++        result = generate_logical_id("exp01", "partition", offset, 0x1000)
++        self.assertEqual(result, "exp01:partition:0x100000000-0x100001000")
++
++    def test_hex_digits_are_lowercase(self):
++        result = generate_logical_id("EXP01", "REGION", 0xAB, 0x10)
++        # experiment_id/kind pass through as given; hex digits are lowercase.
++        self.assertEqual(result, "EXP01:REGION:0x000000ab-0x000000bb")
++
++    def test_zero_size_region(self):
++        result = generate_logical_id("exp01", "boundary", 0x100, 0)
++        self.assertEqual(result, "exp01:boundary:0x00000100-0x00000100")
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index e992a87..f7339e3 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -164,7 +164,13 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+             self.assertEqual(retrieved.finding_id, finding.finding_id)
+             self.assertEqual(retrieved.confidence, ConfidenceLevel.VERIFIED)
+ 
+-            # Test finding without logical_id
++            # Test a legacy-style finding that genuinely has no logical_id,
++            # e.g. a pre-MTKLAB-002 record. Since MTKLAB-002, constructing a
++            # Finding without logical_id auto-generates one (see
++            # test_evidence.py::test_finding_auto_generates_logical_id_when_omitted),
++            # so a NULL value is forced onto the object *after* construction
++            # here to simulate that legacy case and verify the storage layer
++            # still round-trips a genuine NULL without corrupting it.
+             finding_no_id = Finding(
+                 experiment_id="exp01",
+                 kind=FindingKind.STREAM,
+@@ -172,8 +178,8 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+                 size=200,
+                 confidence=ConfidenceLevel.CANDIDATE,
+                 description="Stream finding",
+-                logical_id=None,
+             )
++            finding_no_id.logical_id = None
+             db.store_finding(finding_no_id)
+ 
+             retrieved_no_id = db.get_finding(finding_no_id.finding_id)

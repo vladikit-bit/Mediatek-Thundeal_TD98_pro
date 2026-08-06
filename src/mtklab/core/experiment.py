@@ -173,26 +173,32 @@ class ExperimentRegistry:
     def auto_discover(self, package: str = "mtklab.experiments") -> int:
         """Automatically discover and register experiments from a package."""
         import importlib
-        import pkgutil
+        from pathlib import Path
 
         count = 0
         pkg = importlib.import_module(package)
-        for _, modname, ispkg in pkgutil.iter_modules(pkg.__path__, pkg.__name__ + "."):
-            if ispkg:
-                continue
-            try:
-                mod = importlib.import_module(modname)
-                for attr_name in dir(mod):
-                    attr = getattr(mod, attr_name)
-                    if (
-                        isinstance(attr, type)
-                        and issubclass(attr, Experiment)
-                        and attr is not Experiment
-                        and hasattr(attr, "experiment_id")
-                    ):
-                        exp = attr()
-                        self.register(exp)
-                        count += 1
-            except Exception:
-                pass  # Skip modules that fail to import
+        for pkg_path in pkg.__path__:
+            base_path = Path(pkg_path)
+            for py_file in base_path.glob("**/*.py"):
+                if py_file.name.startswith("_"):
+                    continue
+                rel_path = py_file.relative_to(base_path)
+                mod_parts = [package] + list(rel_path.with_suffix("").parts)
+                modname = ".".join(mod_parts)
+                try:
+                    mod = importlib.import_module(modname)
+                    for attr_name in dir(mod):
+                        attr = getattr(mod, attr_name)
+                        if (
+                            isinstance(attr, type)
+                            and issubclass(attr, Experiment)
+                            and attr is not Experiment
+                            and hasattr(attr, "experiment_id")
+                        ):
+                            if attr.experiment_id not in self._experiments:
+                                exp = attr()
+                                self.register(exp)
+                                count += 1
+                except Exception:
+                    pass  # Skip modules that fail to import
         return count

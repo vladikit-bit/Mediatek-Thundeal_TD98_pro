@@ -13,6 +13,7 @@ from .evidence import (
     Finding,
     FindingKind,
     EvidenceEngine,
+    generate_logical_id,
 )
 from .hypothesis import Hypothesis, HypothesisStatus
 from .project import Project
@@ -28,6 +29,7 @@ __all__ = [
     "Finding",
     "FindingKind",
     "EvidenceEngine",
+    "generate_logical_id",
     "Hypothesis",
     "HypothesisStatus",
     "Project",

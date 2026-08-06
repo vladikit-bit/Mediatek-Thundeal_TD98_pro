@@ -9,11 +9,140 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import click
-import yaml
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
+try:
+    import click
+    CLICK_AVAILABLE = True
+except ImportError:
+    CLICK_AVAILABLE = False
+    import argparse
+
+    class GroupStub:
+        def __init__(self, fn, click_stub):
+            self.fn = fn
+            self.click_stub = click_stub
+
+        def command(self, name=None):
+            def decorator(cmd_fn):
+                cname = name or cmd_fn.__name__.replace("_", "-")
+                self.click_stub._commands[cname] = cmd_fn
+                if not hasattr(cmd_fn, "_opts"):
+                    cmd_fn._opts = []
+                return cmd_fn
+            return decorator
+
+        def __call__(self, argv=None):
+            parser = argparse.ArgumentParser(description=self.fn.__doc__ or "MT5889 RE Laboratory")
+            parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+            subparsers = parser.add_subparsers(dest="subcommand")
+            for cname, cfn in self.click_stub._commands.items():
+                sp = subparsers.add_parser(cname, help=cfn.__doc__)
+                for oargs, okwargs in getattr(cfn, "_opts", []):
+                    flags = [a for a in oargs if a.startswith("-")]
+                    dests = [a for a in oargs if not a.startswith("-")]
+                    if flags:
+                        kw = {}
+                        if dests:
+                            kw["dest"] = dests[0]
+                        if okwargs.get("is_flag"):
+                            kw["action"] = "store_true"
+                        if okwargs.get("help"):
+                            kw["help"] = okwargs["help"]
+                        if okwargs.get("required"):
+                            kw["required"] = okwargs["required"]
+                        sp.add_argument(*flags, **kw)
+                    else:
+                        name = oargs[0].lstrip("-")
+                        kw = {}
+                        if okwargs.get("nargs"):
+                            kw["nargs"] = okwargs["nargs"]
+                        sp.add_argument(name, **kw)
+            parsed = parser.parse_args(argv)
+            if parsed.verbose:
+                logging.getLogger().setLevel(logging.DEBUG)
+            if parsed.subcommand in self.click_stub._commands:
+                fn = self.click_stub._commands[parsed.subcommand]
+                kw = {k: v for k, v in vars(parsed).items() if k not in ("subcommand", "verbose")}
+                if "experiment_ids" in kw and isinstance(kw["experiment_ids"], list):
+                    kw["experiment_ids"] = tuple(kw["experiment_ids"])
+                fn(**kw)
+            else:
+                parser.print_help()
+
+    class ClickStub:
+        def __init__(self):
+            self._commands = {}
+
+        def group(self, *args, **kwargs):
+            def decorator(f):
+                return GroupStub(f, self)
+            return decorator
+
+        def option(self, *args, **kwargs):
+            def decorator(f):
+                if not hasattr(f, "_opts"):
+                    f._opts = []
+                f._opts.append((args, kwargs))
+                return f
+            return decorator
+
+        def argument(self, *args, **kwargs):
+            def decorator(f):
+                if not hasattr(f, "_opts"):
+                    f._opts = []
+                f._opts.append((args, kwargs))
+                return f
+            return decorator
+
+        def Path(self, *args, **kwargs):
+            return str
+
+    click = ClickStub()
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+except ImportError:
+    import re
+
+    class Console:
+        def print(self, *args, **kwargs):
+            msg = " ".join(str(a) for a in args)
+            clean_msg = re.sub(r"\[/?\w+.*?\]", "", msg)
+            print(clean_msg)
+
+    class Table:
+        def __init__(self, title=""):
+            self.title = title
+            self.columns = []
+            self.rows = []
+
+        def add_column(self, name, **kwargs):
+            self.columns.append(name)
+
+        def add_row(self, *vals):
+            self.rows.append(vals)
+
+        def __str__(self):
+            out = [f"=== {self.title} ==="] if self.title else []
+            out.append(" | ".join(self.columns))
+            out.append("-" * 40)
+            for r in self.rows:
+                out.append(" | ".join(str(v) for v in r))
+            return "\n".join(out)
+
+    class Panel:
+        @classmethod
+        def fit(cls, text, title="", **kwargs):
+            clean = re.sub(r"\[/?\w+.*?\]", "", text)
+            if title:
+                return f"=== {title} ===\n{clean}"
+            return clean
 
 from mtklab.core.experiment import ExperimentRegistry, ExperimentContext
 from mtklab.core.evidence import EvidenceEngine
@@ -45,8 +174,8 @@ def get_registry(project: Project) -> ExperimentRegistry:
     
     # Apply config overrides
     config_path = Path("config/experiments.yaml")
-    if config_path.exists():
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if config_path.exists() and yaml is not None:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         for exp_cfg in config.get("experiments", []):
             exp_id = exp_cfg["id"]
             if exp_id in registry._experiments:
@@ -114,7 +243,11 @@ def init_project(name: str, firmware: Optional[str], ree_payload: Optional[str],
         }
     }
     config_path = project_dir / "config.yaml"
-    config_path.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
+    if yaml is not None:
+        config_path.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
+    else:
+        import json
+        config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     
     console.print(Panel.fit(
         f"[green]Project '{name}' initialized successfully![/green]\n\n"
@@ -186,6 +319,9 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
             result = exp.run(ctx)
             result.mark_completed()
             
+            # Store experiment result first so foreign keys reference a valid experiment row
+            proj.db.store_experiment_result(result)
+
             # Submit findings through Evidence Engine
             if result.findings or result.evidences or result.hypotheses:
                 for finding in result.findings:
@@ -194,9 +330,6 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
                 for hyp in result.hypotheses:
                     hyp.hypothesis_id = hyp.hypothesis_id  # ensure set
                     proj.db.store_hypothesis(hyp)
-            
-            # Store experiment result
-            proj.db.store_experiment_result(result)
             
             # Store artifacts
             for artifact_type, path in result.artifacts.items():

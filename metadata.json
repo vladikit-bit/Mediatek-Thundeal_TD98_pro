@@ -1,0 +1,8 @@
+{
+  "name": "MTKLab",
+  "description": "MediaTek Firmware Analysis & Evidence Tracking Toolkit",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -202,9 +202,10 @@ class Exp02RepeatedStructures(Experiment):
             from collections import Counter
             counts = Counter(values)
             entropy = 0
+            import math
             for count in counts.values():
                 p = count / len(values)
-                entropy -= p * (p.bit_length() - 1) / p if p > 0 else 0  # Simplified
+                entropy -= p * math.log2(p) if p > 0 else 0
             
             field_stats.append({
                 "position": pos,
