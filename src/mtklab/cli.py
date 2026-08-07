@@ -53,8 +53,19 @@ except ImportError:
                     else:
                         name = oargs[0].lstrip("-")
                         kw = {}
-                        if okwargs.get("nargs"):
-                            kw["nargs"] = okwargs["nargs"]
+                        click_nargs = okwargs.get("nargs")
+                        if click_nargs is not None:
+                            # Click uses nargs=-1 on @click.argument(...) to mean
+                            # "0 or more" (variadic positional). argparse has no
+                            # such convention: passing -1 straight through makes
+                            # argparse's _get_nargs_pattern() build '(-*%s-*)' %
+                            # '-*'.join('A' * nargs) with 'A' * -1 == '', i.e. a
+                            # pattern that matches ZERO tokens no matter what.
+                            # Any experiment IDs actually supplied on the command
+                            # line then never get consumed by this positional and
+                            # surface as "unrecognized arguments" instead.
+                            # Translate to argparse's own "zero or more" marker.
+                            kw["nargs"] = "*" if click_nargs == -1 else click_nargs
                         sp.add_argument(name, **kw)
             parsed = parser.parse_args(argv)
             if parsed.verbose:

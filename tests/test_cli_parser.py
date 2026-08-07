@@ -1,0 +1,109 @@
+"""Regression tests for the CLI `run` command argument parsing.
+
+These specifically exercise cli.py's fallback ClickStub/GroupStub shim (used
+when the real `click` package is unavailable), which previously passed
+Click's `nargs=-1` convention (variadic positional) straight through to
+argparse's `add_argument(nargs=...)`. argparse has no such convention: an
+integer nargs builds a pattern via `'-*'.join('A' * nargs)`, and
+`'A' * -1 == ''` in Python, so the resulting pattern matched ZERO tokens no
+matter how many experiment IDs were actually supplied on the command line.
+Symptoms: explicit experiment IDs were rejected as "unrecognized arguments"
+while zero IDs were silently (and correctly, but coincidentally) accepted.
+
+The tests force the fallback shim to be used regardless of whether the real
+`click` package happens to be installed in the environment running the
+tests, so this regression is caught either way.
+"""
+
+import builtins
+import sys
+import unittest
+
+
+def _load_cli_with_fallback_shim():
+    """(Re)import mtklab.cli with `click` hidden, forcing the argparse-based
+    ClickStub/GroupStub fallback path (CLICK_AVAILABLE == False)."""
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "click":
+            raise ImportError("simulated: click not installed")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = fake_import
+    try:
+        for mod in list(sys.modules):
+            if mod == "click" or mod.startswith("mtklab"):
+                del sys.modules[mod]
+        from mtklab import cli as cli_module
+    finally:
+        builtins.__import__ = real_import
+
+    assert cli_module.CLICK_AVAILABLE is False, "fallback shim was not activated"
+    return cli_module
+
+
+class TestFallbackShimRunArgumentParsing(unittest.TestCase):
+    """Covers the fallback shim's handling of @click.argument(nargs=-1)."""
+
+    def setUp(self):
+        self.cli_module = _load_cli_with_fallback_shim()
+
+    def tearDown(self):
+        # Restore a normal (real-click, if available) mtklab.cli for any
+        # other test module that imports it after this one runs.
+        for mod in list(sys.modules):
+            if mod == "click" or mod.startswith("mtklab"):
+                del sys.modules[mod]
+
+    def test_zero_experiment_ids_does_not_crash(self):
+        """`run --project X` with no positional IDs and no --all must reach
+        the command body (and its own "nothing to do" exit), not fail during
+        argument parsing."""
+        with self.assertRaises(SystemExit) as cm:
+            self.cli_module.cli(["run", "--project", "nonexistent_test_project__"])
+        # exit code 1 == reached run()'s own "No experiments specified" exit.
+        # exit code 2 would mean argparse itself rejected the input.
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_single_experiment_id_is_accepted_not_unrecognized(self):
+        """A single explicit experiment ID must be parsed as part of
+        experiment_ids, not rejected as an unrecognized top-level argument."""
+        captured = {}
+        original_run = self.cli_module.cli.click_stub._commands["run"]
+
+        def fake_run(project, experiment_ids, run_all, dry_run):
+            captured["project"] = project
+            captured["experiment_ids"] = experiment_ids
+            captured["run_all"] = run_all
+
+        # Preserve the @click.option/@click.argument metadata the real
+        # decorated run() carries; only swap out what executes on match.
+        fake_run._opts = original_run._opts
+        self.cli_module.cli.click_stub._commands["run"] = fake_run
+
+        self.cli_module.cli(["run", "--project", "test_project", "exp00_dummy"])
+        self.assertEqual(captured["project"], "test_project")
+        self.assertEqual(tuple(captured["experiment_ids"]), ("exp00_dummy",))
+
+    def test_multiple_experiment_ids_are_all_captured(self):
+        captured = {}
+        original_run = self.cli_module.cli.click_stub._commands["run"]
+
+        def fake_run(project, experiment_ids, run_all, dry_run):
+            captured["experiment_ids"] = experiment_ids
+
+        fake_run._opts = original_run._opts
+        self.cli_module.cli.click_stub._commands["run"] = fake_run
+
+        self.cli_module.cli([
+            "run", "--project", "test_project", "exp00_dummy", "exp01_entropy_landscape",
+        ])
+        self.assertEqual(
+            tuple(captured["experiment_ids"]),
+            ("exp00_dummy", "exp01_entropy_landscape"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
