@@ -253,5 +253,75 @@ class TestEvidenceAutoContentAddressing(unittest.TestCase):
         self.assertEqual(reconstructed.evidence_id, ev.evidence_id)
 
 
+class TestFromStorageSentinel(unittest.TestCase):
+    """MTKLAB-012: _from_storage=True suppresses __post_init__ entirely,
+    replacing the earlier construct-then-overwrite pattern used by
+    from_dict()/db._row_to_finding()."""
+
+    def test_from_storage_skips_logical_id_autogeneration(self):
+        """Even with offset/size that WOULD normally produce a real
+        logical_id, _from_storage=True must leave an explicit None alone."""
+        f = Finding(
+            experiment_id="exp01",
+            kind=FindingKind.REGION,
+            offset=1024,
+            size=2048,
+            logical_id=None,
+            _from_storage=True,
+        )
+        self.assertIsNone(f.logical_id)
+
+    def test_from_storage_skips_created_version_snapshot(self):
+        f = Finding(experiment_id="exp01", kind=FindingKind.REGION, offset=0, size=10, _from_storage=True)
+        self.assertEqual(f.versions, [])
+
+    def test_from_storage_still_respects_explicit_values(self):
+        """_from_storage only suppresses AUTO-generation; explicitly
+        supplied logical_id/versions are still exactly what ends up on the
+        object (this is what from_dict/_row_to_finding rely on)."""
+        f = Finding(
+            experiment_id="exp01",
+            kind=FindingKind.REGION,
+            offset=0,
+            size=10,
+            logical_id="exp01:region:custom",
+            versions=[{"version": 1, "reason": "restored"}],
+            _from_storage=True,
+        )
+        self.assertEqual(f.logical_id, "exp01:region:custom")
+        self.assertEqual(f.versions, [{"version": 1, "reason": "restored"}])
+
+    def test_default_construction_still_auto_generates(self):
+        """Sanity check: omitting _from_storage (the normal, non-storage
+        construction path) behaves exactly as before -- default False."""
+        f = Finding(experiment_id="exp01", kind=FindingKind.REGION, offset=0, size=10)
+        self.assertIsNotNone(f.logical_id)
+        self.assertEqual(len(f.versions), 1)
+        self.assertEqual(f.versions[0]["reason"], "created")
+
+    def test_from_storage_not_included_in_to_dict(self):
+        f = Finding(experiment_id="exp01", kind=FindingKind.REGION, offset=0, size=10, _from_storage=True)
+        self.assertNotIn("_from_storage", f.to_dict())
+
+    def test_from_storage_not_included_in_equality(self):
+        """field(compare=False): two Findings differing ONLY in
+        _from_storage must still be considered equal."""
+        f1 = Finding(finding_id="x", experiment_id="exp01", kind=FindingKind.REGION,
+                      offset=0, size=10, logical_id="l", versions=[{"version": 1}], _from_storage=True)
+        f2 = Finding(finding_id="x", experiment_id="exp01", kind=FindingKind.REGION,
+                      offset=0, size=10, logical_id="l", versions=[{"version": 1}], _from_storage=True)
+        f2._from_storage = False  # direct attribute flip; does not re-run __post_init__
+        self.assertEqual(f1, f2)
+
+    def test_from_dict_round_trip_matches_from_storage_semantics(self):
+        """End-to-end: from_dict's use of _from_storage=True produces the
+        exact same object a direct _from_storage=True construction would."""
+        original = Finding(experiment_id="exp01", kind=FindingKind.REGION, offset=100, size=50)
+        d = original.to_dict()
+        reconstructed = Finding.from_dict(d)
+        self.assertEqual(reconstructed.logical_id, original.logical_id)
+        self.assertEqual(reconstructed.versions, original.versions)
+
+
 if __name__ == "__main__":
     unittest.main()

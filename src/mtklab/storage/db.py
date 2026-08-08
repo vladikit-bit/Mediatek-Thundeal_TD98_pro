@@ -221,15 +221,16 @@ class EvidenceDatabase:
     def _row_to_finding(self, row: sqlite3.Row) -> Finding:
         """Convert a database row into a Finding object.
 
-        ``logical_id`` and ``versions`` are assigned after construction so that
-        Finding.__post_init__'s logical_id auto-generation (MTKLAB-002) never
-        fires here.  A row's logical_id column is the source of truth for what
-        was actually persisted/indexed; rows written before migration 002 (or
-        before MTKLAB-002 shipped) legitimately have NULL, and the caller must
-        reflect that exactly rather than fabricate a value that was never stored
-        or deduplicated on.
+        MTKLAB-012: constructed with _from_storage=True so
+        Finding.__post_init__'s logical_id/version auto-generation
+        (MTKLAB-002) never fires here at all -- no construct-then-overwrite
+        step. A row's logical_id column is the source of truth for what was
+        actually persisted/indexed; rows written before migration 002 (or
+        before MTKLAB-002 shipped) legitimately have NULL, and this must
+        reflect that exactly rather than fabricate a value that was never
+        stored or deduplicated on.
         """
-        finding = Finding(
+        return Finding(
             finding_id=row["finding_id"],
             experiment_id=row["experiment_id"],
             kind=FindingKind(row["kind"]),
@@ -240,10 +241,10 @@ class EvidenceDatabase:
             description=row["description"],
             evidence_ids=json.loads(row["evidence_ids_json"]),
             metadata=json.loads(row["metadata_json"]),
+            logical_id=row["logical_id"] if "logical_id" in row.keys() else None,
+            versions=json.loads(row["versions_json"]),
+            _from_storage=True,
         )
-        finding.logical_id = row["logical_id"] if "logical_id" in row.keys() else None
-        finding.versions = json.loads(row["versions_json"])
-        return finding
 
     def get_finding(self, finding_id: str) -> Optional[Finding]:
         """Retrieve a finding by ID."""
