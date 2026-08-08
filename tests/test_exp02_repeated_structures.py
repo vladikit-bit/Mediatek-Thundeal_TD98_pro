@@ -1,4 +1,4 @@
-"""Tests for the scalable rewrite of exp02_repeated_structures.
+"""Tests for the scalable, unbiased-coverage rewrite of exp02_repeated_structures.
 
 Background: the original implementation analyzed a candidate region with
 `for pos in range(record_size): for i in range(max_records): ...`, touching
@@ -9,12 +9,30 @@ REE payload (which exp01 classified as a single high-entropy region), this
 made exp02 attempt an unbounded brute-force scan that had to be interrupted
 manually.
 
-These tests cover: (1) the new implementation still produces the exact same
-detection results as the original for identical input, (2) the fallback
-path is bounded (head/tail, not the whole file), (3) any single region is
-capped at max_region_scan_bytes regardless of its true size, and (4) a
-moderately large file completes fast enough to prove runtime no longer
-scales with file size.
+A first scalability pass (mmap, max_region_scan_bytes, fast strided slicing
+in _analyze_records/_field_stats) fixed the runtime problem but introduced
+two false-negative risks, since fixed here:
+
+  - a `quick_sample_bytes` hard-reject on only the first N bytes of a
+    window could silently skip a record_size whose real periodicity only
+    appears later in the region;
+  - a `_bounded_fallback_regions()` head/tail-only fallback assumed
+    structures live only at the start or end of the file -- a
+    MediaTek/MT5889-specific layout assumption with no place in this
+    generic, vendor-independent experiment.
+
+Both are replaced by a single mechanism, `_tile_region()`: when a region
+exceeds the byte budget, coverage is spread evenly across the region's FULL
+SPAN (start, middle, and end all sampled) rather than concentrated at a
+fixed prefix or head/tail. `max_total_scan_bytes` additionally bounds
+aggregate work across all regions in one run, with any shortfall reported
+via `budget_exhausted` / `regions_skipped_due_to_budget` rather than a
+silent gap in coverage.
+
+Correctness tests here avoid wall-clock assertions; boundedness is checked
+structurally (bytes actually analyzed, region/tile counts). A separate,
+clearly-labeled benchmark class exists for optional performance sanity
+checks and is not part of the correctness contract.
 """
 
 import os
@@ -47,6 +65,8 @@ def _make_table_dominant_payload(record_count: int = 4000) -> bytes:
 
 
 class TestFieldStats(unittest.TestCase):
+    """Unchanged code path (explicitly preserved) -- still covered directly."""
+
     def setUp(self):
         self.exp = Exp02RepeatedStructures()
 
@@ -72,6 +92,8 @@ class TestFieldStats(unittest.TestCase):
 
 
 class TestAnalyzeRecords(unittest.TestCase):
+    """Unchanged code path (explicitly preserved) -- still covered directly."""
+
     def setUp(self):
         self.exp = Exp02RepeatedStructures()
 
@@ -155,31 +177,58 @@ class TestAnalyzeRecords(unittest.TestCase):
                 self.assertEqual(old[0], new[0], f"output mismatch at record_size={record_size}")
 
 
-class TestBoundedFallbackRegions(unittest.TestCase):
+class TestTileRegion(unittest.TestCase):
+    """_tile_region() is the single mechanism that replaced both the
+    quick_sample_bytes hard-reject and the head/tail-only fallback. These
+    tests focus specifically on the property that motivated the review:
+    coverage must span the region's FULL LENGTH, not just a fixed prefix,
+    head, or tail."""
+
     def setUp(self):
         self.exp = Exp02RepeatedStructures()
 
-    def test_small_file_single_head_region(self):
-        regions = self.exp._bounded_fallback_regions(file_size=1000, fallback_bytes=4096)
-        self.assertEqual(regions, [(0, 1000)])
+    def test_tiles_span_full_region_not_just_prefix(self):
+        tiles = self.exp._tile_region(region_start=0, region_end=1_000_000, tile_bytes=1000, budget_bytes=8000)
+        self.assertGreaterEqual(len(tiles), 2)
+        starts = [s for s, _ in tiles]
+        # The whole point of this method: coverage must reach well past a
+        # small fixed prefix, unlike the old scan_size-truncated window.
+        self.assertGreater(max(starts), 100_000)
+        for s, e in tiles:
+            self.assertEqual(e - s, 1000)
+            self.assertGreaterEqual(s, 0)
+            self.assertLessEqual(e, 1_000_000)
 
-    def test_file_up_to_2x_fallback_no_tail(self):
-        # file_size == fallback_bytes * 2 exactly: guard is strict '>', so
-        # still head-only (no double-counting the same bytes as head+tail).
-        regions = self.exp._bounded_fallback_regions(file_size=8192, fallback_bytes=4096)
-        self.assertEqual(regions, [(0, 4096)])
+    def test_last_tile_reaches_near_region_end(self):
+        """Coverage must extend close to the end of the region, not stop
+        after a fixed number of bytes from the start -- directly guards
+        against reintroducing a prefix/head-only bias."""
+        region_end = 5_000_000
+        tiles = self.exp._tile_region(0, region_end, tile_bytes=1000, budget_bytes=10000)
+        last_start, last_end = tiles[-1]
+        self.assertGreater(last_end, region_end - 1000)
 
-    def test_large_file_gets_head_and_tail(self):
-        file_size = 10 * 1024 * 1024
-        fallback_bytes = 4096
-        regions = self.exp._bounded_fallback_regions(file_size, fallback_bytes)
-        self.assertEqual(len(regions), 2)
-        head, tail = regions
-        self.assertEqual(head, (0, fallback_bytes))
-        self.assertEqual(tail, (file_size - fallback_bytes, file_size))
-        # Never larger than fallback_bytes each, never the whole file.
-        for start, end in regions:
-            self.assertLessEqual(end - start, fallback_bytes)
+    def test_total_tiled_bytes_within_budget(self):
+        tiles = self.exp._tile_region(0, 10_000_000, tile_bytes=2000, budget_bytes=20000)
+        total = sum(e - s for s, e in tiles)
+        self.assertLessEqual(total, 20000)
+
+    def test_tiny_budget_still_returns_at_least_one_tile(self):
+        tiles = self.exp._tile_region(0, 1_000_000, tile_bytes=5000, budget_bytes=100)
+        self.assertEqual(len(tiles), 1)
+        s, e = tiles[0]
+        self.assertLessEqual(e - s, 100)
+
+    def test_no_duplicate_tiles_when_region_barely_exceeds_budget(self):
+        tiles = self.exp._tile_region(0, 10_001, tile_bytes=1000, budget_bytes=10000)
+        starts = [s for s, _ in tiles]
+        self.assertEqual(len(starts), len(set(starts)), "tile starts must be de-duplicated")
+
+    def test_tiles_never_extend_past_region_bounds(self):
+        tiles = self.exp._tile_region(region_start=500, region_end=1500, tile_bytes=100, budget_bytes=300)
+        for s, e in tiles:
+            self.assertGreaterEqual(s, 500)
+            self.assertLessEqual(e, 1500)
 
 
 class TestRunEndToEnd(unittest.TestCase):
@@ -205,33 +254,47 @@ class TestRunEndToEnd(unittest.TestCase):
         result = Exp02RepeatedStructures().run(ctx)
         self.assertEqual(result.status, "failed")
 
-    def test_fallback_path_is_bounded_and_fast_on_large_file(self):
-        """A file much larger than max_region_scan_bytes must still
-        complete quickly when exp01 supplied no regions -- this is the
-        exact scenario that had to be interrupted manually on the real
-        1.52 GB firmware payload."""
+    def test_empty_payload_handled_cleanly(self):
+        """mmap.mmap(fd, 0, ...) raises ValueError on a genuinely empty
+        file; run() must guard this explicitly rather than crash."""
+        payload_path = self.tmpdir / "empty.bin"
+        payload_path.write_bytes(b"")
+        ctx = self._make_ctx(payload_path, {})
+
+        result = Exp02RepeatedStructures().run(ctx)
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.metadata["regions_scanned"], 0)
+        self.assertEqual(len(result.findings), 0)
+        self.assertEqual(len(result.errors), 0)
+
+    def test_fallback_path_is_bounded_not_proportional_to_file_size(self):
+        """A file much larger than the scan budget must still analyze only
+        a bounded number of bytes when exp01 supplied no regions -- this is
+        the exact scenario that had to be interrupted manually on the real
+        1.52 GB firmware payload. Checked structurally (bytes analyzed),
+        not via a wall-clock assertion."""
         payload_path = self.tmpdir / "large.bin"
-        # 20 MiB of high-entropy data with no real structure: large enough
-        # that the *original* per-byte-loop whole-file fallback took ~80s
-        # in local benchmarking; the new bounded fallback should be near
-        # instant regardless.
         with payload_path.open("wb") as f:
-            f.write(os.urandom(20 * 1024 * 1024))
+            f.write(os.urandom(20 * 1024 * 1024))  # 20 MiB, no real structure
 
         exp = Exp02RepeatedStructures()
         ctx = self._make_ctx(payload_path, shared_data={})  # exp01 found nothing
 
-        t0 = time.time()
         result = exp.run(ctx)
-        elapsed = time.time() - t0
 
-        self.assertLess(elapsed, 5.0, "fallback scan should be bounded, not proportional to file size")
         self.assertFalse(result.metadata["regions_from_exp01"])
-        # 20 MiB > 2x fallback_bytes(4 MiB) -> bounded head AND tail regions,
-        # never a single region spanning the whole 20 MiB file.
-        self.assertEqual(result.metadata["regions_scanned"], 2)
+        self.assertEqual(result.metadata["regions_scanned"], 1)  # whole file = one region
+        self.assertEqual(result.metadata["regions_tiled"], 1)    # region >> budget -> tiled
+        self.assertLessEqual(
+            result.metadata["total_bytes_analyzed"],
+            result.metadata["max_total_scan_bytes"],
+        )
+        # The defining property: bytes actually analyzed must be small
+        # relative to the 20 MiB file, i.e. genuinely bounded.
+        self.assertLess(result.metadata["total_bytes_analyzed"], 20 * 1024 * 1024)
 
-    def test_max_region_scan_bytes_caps_a_huge_region_and_flags_truncation(self):
+    def test_max_region_scan_bytes_caps_a_huge_region_and_flags_tiling(self):
         payload_path = self.tmpdir / "region_test.bin"
         table = _make_table_dominant_payload(record_count=4000)  # 256,000 bytes
         with payload_path.open("wb") as f:
@@ -239,7 +302,7 @@ class TestRunEndToEnd(unittest.TestCase):
             f.write(os.urandom(2 * 1024 * 1024))  # region extends well past the table
 
         exp = Exp02RepeatedStructures()
-        exp.parameters = dict(exp.parameters, max_region_scan_bytes=64 * 1024)  # force truncation
+        exp.parameters = dict(exp.parameters, max_region_scan_bytes=64 * 1024, tile_bytes=16 * 1024)
 
         regions_csv = self.tmpdir / "regions.csv"
         region_end = len(table) + 2 * 1024 * 1024
@@ -252,7 +315,8 @@ class TestRunEndToEnd(unittest.TestCase):
             shared_data={"exp01_entropy_landscape": {"artifacts": {"regions_csv": str(regions_csv)}}},
         )
         result = exp.run(ctx)
-        self.assertEqual(result.metadata["regions_truncated"], 1)
+        self.assertEqual(result.metadata["regions_tiled"], 1)
+        self.assertTrue(any(f.metadata.get("tiled") for f in result.findings))
 
     def test_normal_path_detects_and_reports_table(self):
         payload_path = self.tmpdir / "table.bin"
@@ -273,34 +337,133 @@ class TestRunEndToEnd(unittest.TestCase):
 
         self.assertEqual(result.status, "success")
         self.assertTrue(result.metadata["regions_from_exp01"])
+        self.assertEqual(result.metadata["regions_tiled"], 0)  # small region: no tiling needed
         self.assertGreater(len(result.findings), 0)
         self.assertEqual(len(result.findings), len(result.evidences))
         self.assertIn("tables_csv", result.artifacts)
         self.assertTrue(result.artifacts["tables_csv"].exists())
 
-    def test_tiny_quick_sample_bytes_does_not_cause_false_negative(self):
-        """quick_sample_bytes smaller than record_size*min_records for some
-        candidate must fall through to the full-window check rather than
-        silently rejecting a real table (see run()'s `len(sample) >=
-        record_size * min_records` guard)."""
-        payload_path = self.tmpdir / "table.bin"
-        table = _make_table_dominant_payload(record_count=4000)
-        payload_path.write_bytes(table)
+    def test_detects_structure_far_past_unrelated_prefix(self):
+        """Regression test for the core false-negative concern: the
+        beginning of a large region is unrelated (high-entropy) data, and a
+        valid repeated-record table only starts well past where the OLD
+        prefix-bounded window (or a quick-sample hard-reject) would ever
+        have looked. The new tiled scan must still find it.
+
+        Region layout: [40 KiB unrelated random data][~125 KiB real table].
+        max_region_scan_bytes is deliberately set to 32 KiB -- smaller than
+        the unrelated prefix alone -- so a prefix-only or head-only scan of
+        this region would see NOTHING but noise and report zero findings.
+        """
+        noise_len = 40 * 1024
+        table_bytes = _make_table_dominant_payload(record_count=2000)  # ~125,000 bytes
+        payload = os.urandom(noise_len) + table_bytes
+        payload_path = self.tmpdir / "structure_after_noise.bin"
+        payload_path.write_bytes(payload)
+
+        exp = Exp02RepeatedStructures()
+        exp.parameters = dict(
+            exp.parameters,
+            max_region_scan_bytes=32 * 1024,   # < noise_len: old prefix-only scan finds nothing
+            tile_bytes=8 * 1024,
+            max_total_scan_bytes=256 * 1024,
+        )
 
         regions_csv = self.tmpdir / "regions.csv"
         with regions_csv.open("w", newline="") as f:
             f.write("start,end,class\n")
-            f.write(f"0x00000000,0x{len(table):08X},structured/text/tables\n")
+            f.write(f"0x00000000,0x{len(payload):08X},structured/text/tables\n")
 
-        exp = Exp02RepeatedStructures()
-        # Smaller than 1024 (largest default record_size) * 3 (min_records).
-        exp.parameters = dict(exp.parameters, quick_sample_bytes=256)
         ctx = self._make_ctx(
             payload_path,
             shared_data={"exp01_entropy_landscape": {"artifacts": {"regions_csv": str(regions_csv)}}},
         )
         result = exp.run(ctx)
-        self.assertGreater(len(result.findings), 0)
+
+        self.assertGreater(len(result.findings), 0, "structure past the unrelated prefix must still be found")
+        self.assertEqual(result.metadata["regions_tiled"], 1)
+        # At least one finding must actually fall within the real table's
+        # true span, not merely exist by coincidence elsewhere.
+        table_start = noise_len
+        table_end = noise_len + len(table_bytes)
+        self.assertTrue(
+            any(table_start <= f.offset < table_end for f in result.findings),
+            f"no finding overlaps the real table span [{table_start}, {table_end})",
+        )
+
+    def test_global_budget_is_reported_when_exhausted(self):
+        """Many small regions whose combined size exceeds
+        max_total_scan_bytes must not be silently under-covered -- the
+        shortfall must be visible in metadata."""
+        payload_path = self.tmpdir / "many_regions.bin"
+        payload_path.write_bytes(os.urandom(2 * 1024 * 1024))
+
+        exp = Exp02RepeatedStructures()
+        exp.parameters = dict(
+            exp.parameters,
+            max_region_scan_bytes=4096,
+            tile_bytes=1024,
+            max_total_scan_bytes=8192,  # enough for only ~2 regions at the per-region cap
+        )
+
+        regions_csv = self.tmpdir / "regions.csv"
+        with regions_csv.open("w", newline="") as f:
+            f.write("start,end,class\n")
+            # 20 disjoint regions, each individually well above the
+            # min-records floor, far more than the tiny global budget
+            # allows analyzing in full.
+            for i in range(20):
+                start = i * 100_000
+                end = start + 50_000
+                f.write(f"0x{start:08X},0x{end:08X},structured/text/tables\n")
+
+        ctx = self._make_ctx(
+            payload_path,
+            shared_data={"exp01_entropy_landscape": {"artifacts": {"regions_csv": str(regions_csv)}}},
+        )
+        result = exp.run(ctx)
+
+        self.assertLessEqual(result.metadata["total_bytes_analyzed"], exp.parameters["max_total_scan_bytes"])
+        if result.metadata["regions_skipped_due_to_budget"] > 0:
+            self.assertTrue(result.metadata["budget_exhausted"])
+
+
+class TestPerformanceSanityBenchmark(unittest.TestCase):
+    """Optional, clearly-separated performance sanity check -- NOT part of
+    the correctness contract above. A generous bound here only guards
+    against a catastrophic regression (e.g. accidentally reading the whole
+    file again); it is not a precision timing assertion."""
+
+    def test_large_file_fallback_completes_quickly(self):
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            payload_path = tmpdir / "large.bin"
+            with payload_path.open("wb") as f:
+                f.write(os.urandom(20 * 1024 * 1024))
+
+            artifacts_dir = tmpdir / "artifacts"
+            artifacts_dir.mkdir()
+            ctx = ExperimentContext(
+                firmware_path=payload_path,
+                ree_payload_path=payload_path,
+                config={},
+                evidence_db=None,
+                artifacts_dir=artifacts_dir,
+                shared_data={},
+                progress=ProgressReporter(),
+                logger=__import__("logging").getLogger("mtklab.test"),
+            )
+
+            t0 = time.time()
+            Exp02RepeatedStructures().run(ctx)
+            elapsed = time.time() - t0
+
+            # Generous smoke-test bound (old algorithm measured ~80s on
+            # just 20 MiB); not a tight performance assertion.
+            self.assertLess(elapsed, 15.0)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
