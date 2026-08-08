@@ -385,6 +385,72 @@ class EvidenceDatabase:
             
         return hypotheses
 
+    # --- Run Tracking Operations (MTKLAB-009/010) ---
+
+    def create_run(self, run_id: str, project_id: str, command: str = "", config: Optional[Dict[str, Any]] = None) -> None:
+        """Record a new execution session (parent 'runs' row).
+
+        Must be called before record_experiment_run() for the same run_id:
+        experiment_runs.run_id has an ON DELETE CASCADE foreign key to
+        runs(run_id), enforced by PRAGMA foreign_keys=ON (see __init__).
+        """
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT INTO runs (run_id, project_id, command, config_json) VALUES (?, ?, ?, ?)",
+                (run_id, project_id, command, json.dumps(config or {})),
+            )
+
+    def record_experiment_run(
+        self,
+        run_id: str,
+        experiment_id: str,
+        status: str,
+        duration_seconds: Optional[float] = None,
+        error_message: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Record a single experiment's outcome within a run.
+
+        Status is application-defined (SUCCESS, FAILED, CANCELLED, RUNNING,
+        etc. -- see MTKLAB-009 section 8; intentionally unconstrained at the
+        DB level). Returns the generated experiment_run_id.
+        """
+        experiment_run_id = str(uuid.uuid4())
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                """
+                INSERT INTO experiment_runs (
+                    experiment_run_id, run_id, experiment_id, status,
+                    error_message, duration_seconds, metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    experiment_run_id,
+                    run_id,
+                    experiment_id,
+                    status,
+                    error_message,
+                    duration_seconds,
+                    json.dumps(metrics or {}),
+                ),
+            )
+        return experiment_run_id
+
+    def count_runs(self) -> int:
+        """Total number of recorded execution sessions."""
+        cursor = self._conn.execute("SELECT COUNT(*) AS c FROM runs")
+        return cursor.fetchone()["c"]
+
+    def get_run_experiment_runs(self, run_id: str) -> List[Dict[str, Any]]:
+        """All experiment_runs rows for a given run_id, most recent first."""
+        cursor = self._conn.execute(
+            "SELECT * FROM experiment_runs WHERE run_id = ? ORDER BY created_at DESC",
+            (run_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     # --- Experiment Result & Artifact Operations ---
 
     def store_experiment_result(self, result: Any) -> None:

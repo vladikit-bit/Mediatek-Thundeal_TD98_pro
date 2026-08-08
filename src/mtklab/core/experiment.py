@@ -24,6 +24,17 @@ class ExperimentContext:
     shared_data: dict[str, Any] = field(default_factory=dict)
     progress: "ProgressReporter" = field(default_factory=lambda: ProgressReporter())
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("mtklab.experiment"))
+    # Execution session identifier (MTKLAB-010). None when an experiment is
+    # run outside the `mtklab run` CLI flow (e.g. directly in unit tests or
+    # scripts) -- this is an explicit, documented default, not an error
+    # condition; nothing in the framework requires run_id to be set.
+    #
+    # NOTE: MTKLAB-010's spec places this on `src/mtklab/core/context.py`,
+    # but no such file exists in this codebase -- ExperimentContext has
+    # always lived here in experiment.py. Added in place rather than
+    # splitting the dataclass into a new file, per "prefer incremental
+    # improvements over refactoring."
+    run_id: str | None = None
 
 
 @dataclass

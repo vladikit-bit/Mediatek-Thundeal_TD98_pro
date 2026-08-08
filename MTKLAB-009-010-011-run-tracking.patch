@@ -1,0 +1,713 @@
+diff --git a/src/mtklab/cli.py b/src/mtklab/cli.py
+index 7e8f8bf..30f0017 100644
+--- a/src/mtklab/cli.py
++++ b/src/mtklab/cli.py
+@@ -5,6 +5,8 @@ from __future__ import annotations
+ import logging
+ import shutil
+ import sys
++import time
++import uuid
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Optional
+@@ -314,21 +316,35 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
+     if dry_run:
+         console.print("[yellow]Dry run - not executing.[/yellow]")
+         return
+-    
++
++    # --- MTKLAB-010: create the parent run record before executing anything.
++    # Foreign key from experiment_runs.run_id requires this row to exist
++    # first (PRAGMA foreign_keys=ON, see EvidenceDatabase.__init__).
++    run_id = str(uuid.uuid4())
++    proj.db.create_run(
++        run_id,
++        project_id=project,
++        command=" ".join(sys.argv),
++        config={"experiment_ids": list(experiment_ids), "run_all": run_all, "dry_run": dry_run},
++    )
++
+     # Execute experiments
+     engine = EvidenceEngine(proj.db)
+     
+     for i, exp_id in enumerate(order):
+         exp = registry._experiments[exp_id]
+         console.print(f"\n[cyan][{i+1}/{len(order)}] Running {exp_id}...[/cyan]")
+-        
++
++        start_time = time.time()
+         try:
+             # Prepare context with dependencies
+             ctx = registry.prepare_context(exp_id, proj.create_experiment_context(exp_id))
+-            
++            ctx.run_id = run_id
++
+             # Run experiment
+             result = exp.run(ctx)
+             result.mark_completed()
++            duration = time.time() - start_time
+             
+             # Store experiment result first so foreign keys reference a valid experiment row
+             proj.db.store_experiment_result(result)
+@@ -347,8 +363,45 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
+                 proj.db.store_artifact_reference(exp_id, artifact_type, path, f"Artifact from {exp_id}")
+             
+             console.print(f"  [green]✓ {exp_id}[/green] - {result.status}: {result.summary}")
+-            
++
++            # MTKLAB-010: record this experiment's outcome in experiment_runs.
++            # result.status is "success"/"partial"/"failed"; recorded
++            # uppercased (SUCCESS/PARTIAL/FAILED) -- PARTIAL is an
++            # application-level extension beyond the SUCCESS/FAILED/
++            # CANCELLED/RUNNING examples in MTKLAB-009 sec. 8, which
++            # explicitly leaves status unconstrained at the DB level.
++            #
++            # Note: a "failed" ExperimentResult here did NOT raise --
++            # experiments commonly return status="failed" with a populated
++            # `errors` list (e.g. exp01/exp02's "REE payload not found")
++            # rather than raising an uncaught exception. That is a distinct
++            # path from the `except Exception` branch below, so
++            # error_message must be captured here too or it silently stays
++            # NULL for the most common real-world failure shape.
++            proj.db.record_experiment_run(
++                run_id, exp_id,
++                status=result.status.upper(),
++                duration_seconds=duration,
++                error_message="; ".join(result.errors) if result.errors else None,
++                metrics={"findings": len(result.findings), "evidences": len(result.evidences)},
++            )
++
++        except KeyboardInterrupt:
++            # MTKLAB-010 edge case: Ctrl+C during an experiment records
++            # CANCELLED for the in-flight experiment (not yet-unstarted
++            # ones -- the run stops here) and exits cleanly rather than
++            # dumping a raw traceback.
++            duration = time.time() - start_time
++            console.print(f"\n  [yellow]⚠ {exp_id}[/yellow] - cancelled by user")
++            proj.db.record_experiment_run(
++                run_id, exp_id, status="CANCELLED", duration_seconds=duration,
++                error_message="Cancelled by user (SIGINT)",
++            )
++            console.print("[yellow]Run cancelled.[/yellow]")
++            sys.exit(130)  # conventional exit code for SIGINT
++
+         except Exception as e:
++            duration = time.time() - start_time
+             logger.exception(f"Experiment {exp_id} failed")
+             console.print(f"  [red]✗ {exp_id}[/red] - failed: {e}")
+             # Store failed result
+@@ -361,6 +414,13 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
+             )
+             failed_result.mark_completed()
+             proj.db.store_experiment_result(failed_result)
++
++            # MTKLAB-010: record the failure in experiment_runs, capturing
++            # the exception message as error_message.
++            proj.db.record_experiment_run(
++                run_id, exp_id, status="FAILED", duration_seconds=duration,
++                error_message=str(e),
++            )
+     
+     console.print("\n[bold green]All experiments completed.[/bold green]")
+ 
+@@ -395,7 +455,8 @@ def list_experiments(project: str):
+ @click.option("--project", "-p", required=True, help="Project name")
+ @click.argument("experiment_id")
+ def inspect(project: str, experiment_id: str):
+-    """Show detailed JSON for an experiment result."""
++    """Show detailed JSON for an experiment result, or a finding's version
++    history when the argument matches a logical_id or finding_id instead."""
+     proj = get_project(project)
+     
+     # Get experiment result from DB
+@@ -403,9 +464,26 @@ def inspect(project: str, experiment_id: str):
+         "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+     )
+     row = cursor.fetchone()
+-    
++
+     if not row:
+-        console.print(f"[red]Experiment '{experiment_id}' not found in project '{project}'.[/red]")
++        # MTKLAB-011: not an experiment_id -- try it as a finding lookup
++        # instead (logical_id first, then legacy finding_id UUID), before
++        # falling back to the original "not found" error. Tried in this
++        # order, not merged into one command signature change, to keep
++        # `mtklab inspect <experiment_id>` behaving exactly as before for
++        # anyone already relying on it -- the MTKLAB-011 spec text assumes
++        # `inspect` already looked up findings, which is not the case in
++        # this codebase; see accompanying report for details.
++        finding = proj.db.get_latest_finding_by_logical_id(experiment_id)
++        if finding is None:
++            finding = proj.db.get_finding(experiment_id)
++        if finding is not None:
++            _inspect_finding(proj, finding)
++            return
++        console.print(
++            f"[red]No experiment, logical_id, or finding_id matching "
++            f"'{experiment_id}' found in project '{project}'.[/red]"
++        )
+         sys.exit(1)
+     
+     from mtklab.utils import json as json_utils
+@@ -434,7 +512,41 @@ def inspect(project: str, experiment_id: str):
+     
+     result["findings"] = findings
+     
+-    console.print(json_utils.dumps(result, indent=2))
++    console.print(json_utils.dumps(result, indent=2), soft_wrap=True)
++
++
++def _inspect_finding(proj: Project, finding) -> None:
++    """MTKLAB-011: render a finding's full version timeline plus its
++    content-addressed evidence (via the finding_evidences junction table,
++    MTKLAB-008), for `mtklab inspect <logical_id_or_finding_id>`."""
++    from mtklab.utils import json as json_utils
++
++    evidences = proj.db.get_evidences_for_finding(finding.finding_id)
++
++    result = {
++        "finding_id": finding.finding_id,
++        "logical_id": finding.logical_id,
++        "experiment_id": finding.experiment_id,
++        "kind": finding.kind.value if hasattr(finding.kind, "value") else str(finding.kind),
++        "offset": finding.offset,
++        "size": finding.size,
++        "confidence": finding.confidence.name,
++        "label": finding.label,
++        "description": finding.description,
++        "version_count": len(finding.versions),
++        "versions": finding.versions,
++        "evidence": [
++            {
++                "evidence_id": e.evidence_id,
++                "evidence_type": str(e.evidence_type),
++                "confidence": e.confidence.name,
++                "description": e.description,
++                "data": e.data,
++            }
++            for e in evidences
++        ],
++    }
++    console.print(json_utils.dumps(result, indent=2), soft_wrap=True)
+ 
+ 
+ @cli.command()
+@@ -462,16 +574,35 @@ def status(project: str):
+     # Hypothesis counts
+     cursor = proj.db._conn.execute("SELECT status, COUNT(*) as cnt FROM hypotheses GROUP BY status")
+     hyp_stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
+-    
++
++    # MTKLAB-011: run count and unique logical_id count. Both are simple
++    # COUNT queries -- naturally 0 on an empty/fresh project database
++    # rather than raising (edge case sec. 8: "zero runs or zero findings").
++    run_count = proj.db.count_runs()
++    cursor = proj.db._conn.execute(
++        "SELECT COUNT(DISTINCT logical_id) as cnt FROM findings WHERE logical_id IS NOT NULL"
++    )
++    logical_finding_count = cursor.fetchone()["cnt"]
++
++    # Confidence breakdown across the three lifecycle levels (RFC.md 4.1),
++    # explicitly zero-filled so the summary is stable even before any
++    # findings of a given confidence exist.
++    confidence_breakdown = "\n".join(
++        f"  {level}: {find_stats.get(level, 0)}"
++        for level in ("CANDIDATE", "PROBABLE", "VERIFIED")
++    )
++
+     console.print(Panel.fit(
+         f"[bold]Project:[/bold] {project}\n"
+         f"[bold]Directory:[/bold] {proj.project_dir}\n"
+         f"[bold]Firmware:[/bold] {proj.get_firmware_path()}\n"
+         f"[bold]REE Payload:[/bold] {proj.get_ree_payload_path()}\n\n"
++        f"[bold]Runs:[/bold] {run_count} total\n\n"
+         f"[bold]Experiments:[/bold] {sum(exp_stats.values())} total\n"
+         + "\n".join(f"  {k}: {v}" for k, v in exp_stats.items()) + "\n\n"
+-        f"[bold]Findings:[/bold] {sum(find_stats.values())} total\n"
+-        + "\n".join(f"  {k}: {v}" for k, v in find_stats.items()) + "\n\n"
++        f"[bold]Findings:[/bold] {sum(find_stats.values())} total "
++        f"({logical_finding_count} unique logical_id)\n"
++        f"{confidence_breakdown}\n\n"
+         f"[bold]Hypotheses:[/bold] {sum(hyp_stats.values())} total\n"
+         + "\n".join(f"  {k}: {v}" for k, v in hyp_stats.items()),
+         title="Project Status",
+diff --git a/src/mtklab/core/experiment.py b/src/mtklab/core/experiment.py
+index a320351..8f01d0b 100644
+--- a/src/mtklab/core/experiment.py
++++ b/src/mtklab/core/experiment.py
+@@ -24,6 +24,17 @@ class ExperimentContext:
+     shared_data: dict[str, Any] = field(default_factory=dict)
+     progress: "ProgressReporter" = field(default_factory=lambda: ProgressReporter())
+     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("mtklab.experiment"))
++    # Execution session identifier (MTKLAB-010). None when an experiment is
++    # run outside the `mtklab run` CLI flow (e.g. directly in unit tests or
++    # scripts) -- this is an explicit, documented default, not an error
++    # condition; nothing in the framework requires run_id to be set.
++    #
++    # NOTE: MTKLAB-010's spec places this on `src/mtklab/core/context.py`,
++    # but no such file exists in this codebase -- ExperimentContext has
++    # always lived here in experiment.py. Added in place rather than
++    # splitting the dataclass into a new file, per "prefer incremental
++    # improvements over refactoring."
++    run_id: str | None = None
+ 
+ 
+ @dataclass
+diff --git a/src/mtklab/storage/db.py b/src/mtklab/storage/db.py
+index d66c19c..a6ba51d 100644
+--- a/src/mtklab/storage/db.py
++++ b/src/mtklab/storage/db.py
+@@ -385,6 +385,72 @@ class EvidenceDatabase:
+             
+         return hypotheses
+ 
++    # --- Run Tracking Operations (MTKLAB-009/010) ---
++
++    def create_run(self, run_id: str, project_id: str, command: str = "", config: Optional[Dict[str, Any]] = None) -> None:
++        """Record a new execution session (parent 'runs' row).
++
++        Must be called before record_experiment_run() for the same run_id:
++        experiment_runs.run_id has an ON DELETE CASCADE foreign key to
++        runs(run_id), enforced by PRAGMA foreign_keys=ON (see __init__).
++        """
++        with self._conn:
++            self._conn.execute("BEGIN IMMEDIATE")
++            self._conn.execute(
++                "INSERT INTO runs (run_id, project_id, command, config_json) VALUES (?, ?, ?, ?)",
++                (run_id, project_id, command, json.dumps(config or {})),
++            )
++
++    def record_experiment_run(
++        self,
++        run_id: str,
++        experiment_id: str,
++        status: str,
++        duration_seconds: Optional[float] = None,
++        error_message: Optional[str] = None,
++        metrics: Optional[Dict[str, Any]] = None,
++    ) -> str:
++        """Record a single experiment's outcome within a run.
++
++        Status is application-defined (SUCCESS, FAILED, CANCELLED, RUNNING,
++        etc. -- see MTKLAB-009 section 8; intentionally unconstrained at the
++        DB level). Returns the generated experiment_run_id.
++        """
++        experiment_run_id = str(uuid.uuid4())
++        with self._conn:
++            self._conn.execute("BEGIN IMMEDIATE")
++            self._conn.execute(
++                """
++                INSERT INTO experiment_runs (
++                    experiment_run_id, run_id, experiment_id, status,
++                    error_message, duration_seconds, metrics_json
++                ) VALUES (?, ?, ?, ?, ?, ?, ?)
++                """,
++                (
++                    experiment_run_id,
++                    run_id,
++                    experiment_id,
++                    status,
++                    error_message,
++                    duration_seconds,
++                    json.dumps(metrics or {}),
++                ),
++            )
++        return experiment_run_id
++
++    def count_runs(self) -> int:
++        """Total number of recorded execution sessions."""
++        cursor = self._conn.execute("SELECT COUNT(*) AS c FROM runs")
++        return cursor.fetchone()["c"]
++
++    def get_run_experiment_runs(self, run_id: str) -> List[Dict[str, Any]]:
++        """All experiment_runs rows for a given run_id, most recent first."""
++        cursor = self._conn.execute(
++            "SELECT * FROM experiment_runs WHERE run_id = ? ORDER BY created_at DESC",
++            (run_id,),
++        )
++        return [dict(row) for row in cursor.fetchall()]
++
+     # --- Experiment Result & Artifact Operations ---
+ 
+     def store_experiment_result(self, result: Any) -> None:
+diff --git a/src/mtklab/storage/migrations/004_runs.sql b/src/mtklab/storage/migrations/004_runs.sql
+new file mode 100644
+index 0000000..76bd1ce
+--- /dev/null
++++ b/src/mtklab/storage/migrations/004_runs.sql
+@@ -0,0 +1,22 @@
++-- Migration 004: Create runs and experiment_runs tracking tables
++CREATE TABLE IF NOT EXISTS runs (
++    run_id TEXT PRIMARY KEY,
++    project_id TEXT NOT NULL,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++    command TEXT,
++    config_json TEXT
++);
++
++CREATE TABLE IF NOT EXISTS experiment_runs (
++    experiment_run_id TEXT PRIMARY KEY,
++    run_id TEXT NOT NULL,
++    experiment_id TEXT NOT NULL,
++    status TEXT NOT NULL,
++    error_message TEXT,
++    duration_seconds REAL,
++    metrics_json TEXT,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS idx_experiment_runs_run_id ON experiment_runs(run_id);
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+new file mode 100644
+index 0000000..d57b168
+--- /dev/null
++++ b/tests/test_cli.py
+@@ -0,0 +1,193 @@
++"""Integration tests for the CLI (MTKLAB-010 run tracking, MTKLAB-011
++status/inspect enhancements), using Click's real CliRunner against an
++isolated filesystem so nothing touches the actual data/projects directory."""
++
++import json
++import sqlite3
++import unittest
++
++from click.testing import CliRunner
++
++from mtklab.cli import cli
++
++
++class TestCLIRunTracking(unittest.TestCase):
++    """MTKLAB-010: `mtklab run` creates runs/experiment_runs records."""
++
++    def setUp(self):
++        self.runner = CliRunner()
++
++    def _init_project(self, name="proj"):
++        result = self.runner.invoke(cli, ["init-project", name])
++        self.assertEqual(result.exit_code, 0, result.output)
++
++    def _query(self, db_path, sql, params=()):
++        conn = sqlite3.connect(db_path)
++        conn.row_factory = sqlite3.Row
++        try:
++            return [dict(r) for r in conn.execute(sql, params).fetchall()]
++        finally:
++            conn.close()
++
++    def test_run_creates_run_and_experiment_run_records(self):
++        with self.runner.isolated_filesystem():
++            self._init_project("proj")
++            result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
++            self.assertEqual(result.exit_code, 0, result.output)
++
++            db_path = "data/projects/proj/evidence.db"
++            runs = self._query(db_path, "SELECT * FROM runs")
++            self.assertEqual(len(runs), 1)
++            self.assertEqual(runs[0]["project_id"], "proj")
++
++            exp_runs = self._query(db_path, "SELECT * FROM experiment_runs")
++            self.assertEqual(len(exp_runs), 1)
++            self.assertEqual(exp_runs[0]["experiment_id"], "exp00_dummy")
++            self.assertEqual(exp_runs[0]["status"], "SUCCESS")
++            self.assertIsNotNone(exp_runs[0]["duration_seconds"])
++            self.assertEqual(exp_runs[0]["run_id"], runs[0]["run_id"])
++
++    def test_run_clean_failure_records_status_and_error_message(self):
++        """A "failed" ExperimentResult returned WITHOUT raising (e.g.
++        exp01's "REE payload not found") must still populate
++        error_message, not just status -- this does not go through the
++        `except Exception` branch at all."""
++        with self.runner.isolated_filesystem():
++            self._init_project("proj")
++            result = self.runner.invoke(cli, ["run", "--project", "proj", "exp01_entropy_landscape"])
++            self.assertEqual(result.exit_code, 0, result.output)
++
++            db_path = "data/projects/proj/evidence.db"
++            exp_runs = self._query(db_path, "SELECT * FROM experiment_runs")
++            self.assertEqual(len(exp_runs), 1)
++            self.assertEqual(exp_runs[0]["status"], "FAILED")
++            self.assertIsNotNone(exp_runs[0]["error_message"])
++            self.assertIn("not found", exp_runs[0]["error_message"])
++
++    def test_run_raised_exception_records_failed_with_error_message(self):
++        """The `except Exception` branch: an experiment that genuinely
++        raises must also be recorded as FAILED with the exception message."""
++        with self.runner.isolated_filesystem():
++            self._init_project("proj")
++
++            import mtklab.experiments.exp00_dummy.exp00_dummy as exp00_mod
++
++            original_run = exp00_mod.Exp00Dummy.run
++
++            def boom(self, ctx):
++                raise RuntimeError("synthetic failure for testing")
++
++            exp00_mod.Exp00Dummy.run = boom
++            try:
++                result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
++            finally:
++                exp00_mod.Exp00Dummy.run = original_run
++
++            self.assertEqual(result.exit_code, 0, result.output)
++            db_path = "data/projects/proj/evidence.db"
++            exp_runs = self._query(db_path, "SELECT * FROM experiment_runs")
++            self.assertEqual(exp_runs[0]["status"], "FAILED")
++            self.assertIn("synthetic failure", exp_runs[0]["error_message"])
++
++    def test_run_id_is_shared_across_multiple_experiments_in_one_run(self):
++        with self.runner.isolated_filesystem():
++            self._init_project("proj")
++            result = self.runner.invoke(
++                cli, ["run", "--project", "proj", "exp00_dummy", "exp01_entropy_landscape"]
++            )
++            self.assertEqual(result.exit_code, 0, result.output)
++
++            db_path = "data/projects/proj/evidence.db"
++            runs = self._query(db_path, "SELECT * FROM runs")
++            exp_runs = self._query(db_path, "SELECT * FROM experiment_runs")
++            self.assertEqual(len(runs), 1)
++            self.assertEqual(len(exp_runs), 2)
++            self.assertTrue(all(er["run_id"] == runs[0]["run_id"] for er in exp_runs))
++
++    def test_dry_run_creates_no_run_records(self):
++        """--dry-run must not create a runs row at all (nothing executes)."""
++        with self.runner.isolated_filesystem():
++            self._init_project("proj")
++            result = self.runner.invoke(cli, ["run", "--project", "proj", "--all", "--dry-run"])
++            self.assertEqual(result.exit_code, 0, result.output)
++            db_path = "data/projects/proj/evidence.db"
++            self.assertEqual(self._query(db_path, "SELECT * FROM runs"), [])
++
++
++class TestCLIStatusAndInspect(unittest.TestCase):
++    """MTKLAB-011: `mtklab status` / `mtklab inspect` enhancements."""
++
++    def setUp(self):
++        self.runner = CliRunner()
++
++    def _init_and_run(self, project="proj", *experiment_ids):
++        self.runner.invoke(cli, ["init-project", project])
++        return self.runner.invoke(cli, ["run", "--project", project, *experiment_ids])
++
++    def test_status_shows_run_count_and_logical_id_count_on_empty_project(self):
++        """Edge case (sec. 8): zero runs / zero findings must render
++        cleanly, no traceback."""
++        with self.runner.isolated_filesystem():
++            self.runner.invoke(cli, ["init-project", "proj"])
++            result = self.runner.invoke(cli, ["status", "--project", "proj"])
++            self.assertEqual(result.exit_code, 0, result.output)
++            self.assertIn("Runs:", result.output)
++            self.assertIn("0 total", result.output)
++
++    def test_status_after_run_shows_nonzero_counts(self):
++        with self.runner.isolated_filesystem():
++            run_result = self._init_and_run("proj", "exp00_dummy")
++            self.assertEqual(run_result.exit_code, 0, run_result.output)
++
++            result = self.runner.invoke(cli, ["status", "--project", "proj"])
++            self.assertEqual(result.exit_code, 0, result.output)
++            self.assertIn("Runs:", result.output)
++            self.assertIn("1 total", result.output)
++            self.assertIn("unique logical_id", result.output)
++            self.assertIn("CANDIDATE", result.output)
++
++    def test_inspect_by_experiment_id_still_works_unchanged(self):
++        """Backward compatibility: inspect <experiment_id> keeps showing
++        the experiment JSON exactly as before MTKLAB-011."""
++        with self.runner.isolated_filesystem():
++            run_result = self._init_and_run("proj", "exp00_dummy")
++            self.assertEqual(run_result.exit_code, 0, run_result.output)
++
++            result = self.runner.invoke(cli, ["inspect", "--project", "proj", "exp00_dummy"])
++            self.assertEqual(result.exit_code, 0, result.output)
++            payload = json.loads(result.output)
++            self.assertEqual(payload["experiment_id"], "exp00_dummy")
++            self.assertIn("findings", payload)
++
++    def test_inspect_by_logical_id_shows_version_history_and_evidence(self):
++        with self.runner.isolated_filesystem():
++            run_result = self._init_and_run("proj", "exp00_dummy")
++            self.assertEqual(run_result.exit_code, 0, run_result.output)
++
++            db_path = "data/projects/proj/evidence.db"
++            conn = sqlite3.connect(db_path)
++            conn.row_factory = sqlite3.Row
++            logical_id = conn.execute(
++                "SELECT logical_id FROM findings WHERE logical_id IS NOT NULL LIMIT 1"
++            ).fetchone()["logical_id"]
++            conn.close()
++            self.assertIsNotNone(logical_id)
++
++            result = self.runner.invoke(cli, ["inspect", "--project", "proj", logical_id])
++            self.assertEqual(result.exit_code, 0, result.output)
++            payload = json.loads(result.output)
++            self.assertEqual(payload["logical_id"], logical_id)
++            self.assertIn("versions", payload)
++            self.assertIn("evidence", payload)
++            self.assertGreater(len(payload["versions"]), 0)
++
++    def test_inspect_nonexistent_identifier_exits_1_with_clear_message(self):
++        with self.runner.isolated_filesystem():
++            self.runner.invoke(cli, ["init-project", "proj"])
++            result = self.runner.invoke(cli, ["inspect", "--project", "proj", "does-not-exist-anywhere"])
++            self.assertEqual(result.exit_code, 1)
++            self.assertIn("No experiment, logical_id, or finding_id", result.output)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 7040406..19d2617 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -1,5 +1,6 @@
+ """Migration, foreign key enforcement, and storage tests for EvidenceDatabase."""
+ 
++import json
+ import sqlite3
+ import tempfile
+ import unittest
+@@ -76,12 +77,11 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+         migrator.apply_migrations()
+ 
+         # Check applied migrations. All pending migrations get applied
+-        # (001 was already present, 002 and 003 -- junction tables,
+-        # MTKLAB-007 -- were both pending), not just 002; that's the
+-        # correct, intended behavior of apply_migrations().
++        # (001 was already present, 002/003/004 were pending), not just
++        # 002; that's the correct, intended behavior of apply_migrations().
+         cursor = conn.execute("SELECT version FROM schema_migrations ORDER BY version")
+         versions = [row[0] for row in cursor.fetchall()]
+-        self.assertEqual(versions, [1, 2, 3])
++        self.assertEqual(versions, [1, 2, 3, 4])
+ 
+         # Verify logical_id column exists
+         cursor = conn.execute("PRAGMA table_info(findings)")
+@@ -102,6 +102,13 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+         junction_tables = {row[0] for row in cursor.fetchall()}
+         self.assertEqual(junction_tables, {"finding_evidences", "hypothesis_evidences"})
+ 
++        # Verify migration 004 (MTKLAB-009) also ran: run-tracking tables.
++        cursor = conn.execute(
++            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('runs', 'experiment_runs')"
++        )
++        run_tables = {row[0] for row in cursor.fetchall()}
++        self.assertEqual(run_tables, {"runs", "experiment_runs"})
++
+         # Query existing finding inserted before migration
+         cursor = conn.execute("SELECT finding_id, logical_id FROM findings WHERE finding_id = 'f1'")
+         row = cursor.fetchone()
+@@ -717,6 +724,111 @@ class TestJunctionTables(unittest.TestCase):
+             db.close()
+ 
+ 
++class TestRunTracking(unittest.TestCase):
++    """Tests for the runs / experiment_runs tables (MTKLAB-009 migration)
++    and create_run() / record_experiment_run() (MTKLAB-010)."""
++
++    def setUp(self):
++        self.temp_dir = tempfile.TemporaryDirectory()
++        self.db_path = Path(self.temp_dir.name) / "test_runs.db"
++        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
++
++    def tearDown(self):
++        self.temp_dir.cleanup()
++
++    def test_create_run_inserts_row(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            db.create_run("run1", project_id="test_project", command="mtklab run --all", config={"x": 1})
++            cursor = db._conn.execute("SELECT * FROM runs WHERE run_id = ?", ("run1",))
++            row = cursor.fetchone()
++            self.assertIsNotNone(row)
++            self.assertEqual(row["project_id"], "test_project")
++            self.assertEqual(row["command"], "mtklab run --all")
++            self.assertEqual(json.loads(row["config_json"]), {"x": 1})
++        finally:
++            db.close()
++
++    def test_count_runs(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self.assertEqual(db.count_runs(), 0)
++            db.create_run("run1", project_id="p")
++            db.create_run("run2", project_id="p")
++            self.assertEqual(db.count_runs(), 2)
++        finally:
++            db.close()
++
++    def test_record_experiment_run_success(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            db.create_run("run1", project_id="p")
++            exp_run_id = db.record_experiment_run(
++                "run1", "exp01_entropy_landscape", status="SUCCESS",
++                duration_seconds=1.23, metrics={"findings": 2},
++            )
++            self.assertIsInstance(exp_run_id, str)
++            rows = db.get_run_experiment_runs("run1")
++            self.assertEqual(len(rows), 1)
++            self.assertEqual(rows[0]["status"], "SUCCESS")
++            self.assertEqual(rows[0]["duration_seconds"], 1.23)
++            self.assertIsNone(rows[0]["error_message"])
++        finally:
++            db.close()
++
++    def test_record_experiment_run_failure_captures_error_message(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            db.create_run("run1", project_id="p")
++            db.record_experiment_run(
++                "run1", "exp02_repeated_structures", status="FAILED",
++                error_message="boom: something broke",
++            )
++            rows = db.get_run_experiment_runs("run1")
++            self.assertEqual(rows[0]["status"], "FAILED")
++            self.assertEqual(rows[0]["error_message"], "boom: something broke")
++        finally:
++            db.close()
++
++    def test_record_experiment_run_requires_existing_run_id(self):
++        """FOREIGN KEY (run_id) REFERENCES runs(run_id) -- must raise for
++        a run_id that was never created via create_run()."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            with self.assertRaises(sqlite3.IntegrityError):
++                db.record_experiment_run("nonexistent_run", "exp01", status="SUCCESS")
++        finally:
++            db.close()
++
++    def test_run_cascade_delete_removes_experiment_runs(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            db.create_run("run1", project_id="p")
++            db.record_experiment_run("run1", "exp01", status="SUCCESS")
++            db._conn.execute("DELETE FROM runs WHERE run_id = ?", ("run1",))
++            db._conn.commit()
++            self.assertEqual(db.get_run_experiment_runs("run1"), [])
++        finally:
++            db.close()
++
++    def test_full_migration_pipeline_001_through_004(self):
++        """Integration test (section 9): fresh DB gets all four migrations
++        and both new tables exist with correct schema."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            cursor = db._conn.execute("SELECT version FROM schema_migrations ORDER BY version")
++            self.assertEqual([r[0] for r in cursor.fetchall()], [1, 2, 3, 4])
++            cursor = db._conn.execute("PRAGMA table_info(experiment_runs)")
++            cols = {row[1] for row in cursor.fetchall()}
++            self.assertEqual(
++                cols,
++                {"experiment_run_id", "run_id", "experiment_id", "status",
++                 "error_message", "duration_seconds", "metrics_json", "created_at"},
++            )
++        finally:
++            db.close()
++
++
+ if __name__ == "__main__":
+     unittest.main()
+ 

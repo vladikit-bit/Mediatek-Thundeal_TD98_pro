@@ -1,0 +1,486 @@
+diff --git a/src/mtklab/core/evidence.py b/src/mtklab/core/evidence.py
+index b9e6b7e..ed978df 100644
+--- a/src/mtklab/core/evidence.py
++++ b/src/mtklab/core/evidence.py
+@@ -308,7 +308,8 @@ class EvidenceEngine:
+            - Content Unchanged → return existing finding (no new DB record).
+            - Content Modified → new finding_id UUID, increment version.
+            - New Finding → version 1 from __post_init__.
+-        5. **Persist** finding and update related hypotheses.
++        5. **Persist** finding, link evidence via the finding_evidences
++           junction table (MTKLAB-008), and update related hypotheses.
+ 
+         Args:
+             finding: The Finding to register.
+@@ -337,7 +338,14 @@ class EvidenceEngine:
+         # 4. Deduplication and versioning
+         if existing:
+             if self._is_finding_unchanged(existing, finding):
+-                # Content unchanged — return existing finding without new DB record
++                # Content unchanged — return existing finding without new DB
++                # record. Any newly-submitted evidence was still persisted
++                # in step 2 above, so it must still be linked to the finding
++                # actually being returned (existing.finding_id), or it would
++                # be recorded in `evidences` but orphaned from
++                # `finding_evidences` (MTKLAB-008).
++                if finding.evidence_ids:
++                    self.db.link_finding_evidences(existing.finding_id, finding.evidence_ids)
+                 return existing
+             # Content modified — generate new finding_id and add version snapshot
+             finding.finding_id = str(uuid.uuid4())
+@@ -349,8 +357,10 @@ class EvidenceEngine:
+             # Add submission snapshot to capture post-evidence confidence state
+             finding.add_version("initial_submission")
+ 
+-        # 5. Store finding and update hypotheses
++        # 5. Store finding, link its evidence, and update hypotheses
+         self.db.store_finding(finding)
++        if finding.evidence_ids:
++            self.db.link_finding_evidences(finding.finding_id, finding.evidence_ids)
+         self._update_hypotheses(finding)
+ 
+         return finding
+diff --git a/src/mtklab/storage/db.py b/src/mtklab/storage/db.py
+index 2174453..d66c19c 100644
+--- a/src/mtklab/storage/db.py
++++ b/src/mtklab/storage/db.py
+@@ -110,6 +110,59 @@ class EvidenceDatabase:
+             timestamp=datetime.fromisoformat(row["timestamp"])
+         )
+ 
++    # --- Junction Operations (MTKLAB-007/008) ---
++
++    def link_finding_evidences(self, finding_id: str, evidence_ids: List[str]) -> None:
++        """Record finding<->evidence links in the normalized junction table.
++
++        Both finding_id and every evidence_id must already exist in their
++        respective tables (finding_evidences has ON DELETE CASCADE foreign
++        keys to findings/evidences, and PRAGMA foreign_keys=ON is set on
++        this connection -- see __init__), so this must only be called after
++        store_finding()/store_evidence() for the referenced rows. Safe to
++        call with an empty list (no-ops). INSERT OR IGNORE makes re-linking
++        an already-linked pair a harmless no-op, matching the composite
++        PRIMARY KEY (finding_id, evidence_id).
++        """
++        if not evidence_ids:
++            return
++        with self._conn:
++            self._conn.execute("BEGIN IMMEDIATE")
++            for eid in evidence_ids:
++                self._conn.execute(
++                    "INSERT OR IGNORE INTO finding_evidences (finding_id, evidence_id) VALUES (?, ?)",
++                    (finding_id, str(eid)),
++                )
++
++    def get_evidences_for_finding(self, finding_id: str) -> List[Evidence]:
++        """Retrieve all evidence linked to a finding via the normalized
++        finding_evidences junction table (MTKLAB-008), not the deprecated
++        evidence_ids_json column on findings."""
++        cursor = self._conn.execute(
++            """
++            SELECT e.* FROM evidences e
++            JOIN finding_evidences fe ON fe.evidence_id = e.evidence_id
++            WHERE fe.finding_id = ?
++            ORDER BY fe.created_at
++            """,
++            (finding_id,),
++        )
++        return [
++            Evidence(
++                evidence_id=row["evidence_id"],
++                experiment_id=row["experiment_id"],
++                evidence_type=EvidenceType(row["evidence_type"]),
++                confidence=ConfidenceLevel[row["confidence"]],
++                description=row["description"],
++                data=json.loads(row["data_json"]),
++                source_offset=row["source_offset"],
++                source_size=row["source_size"],
++                tags=json.loads(row["tags_json"]),
++                timestamp=datetime.fromisoformat(row["timestamp"]),
++            )
++            for row in cursor.fetchall()
++        ]
++
+     # --- Finding Operations ---
+ 
+     def store_finding(self, finding: Finding) -> None:
+diff --git a/src/mtklab/storage/migrations/003_junctions.sql b/src/mtklab/storage/migrations/003_junctions.sql
+new file mode 100644
+index 0000000..c08c820
+--- /dev/null
++++ b/src/mtklab/storage/migrations/003_junctions.sql
+@@ -0,0 +1,24 @@
++-- Migration 003: Create junction tables for normalized evidence links
++CREATE TABLE IF NOT EXISTS finding_evidences (
++    finding_id TEXT NOT NULL,
++    evidence_id TEXT NOT NULL,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++    PRIMARY KEY (finding_id, evidence_id),
++    FOREIGN KEY (finding_id) REFERENCES findings(finding_id) ON DELETE CASCADE,
++    FOREIGN KEY (evidence_id) REFERENCES evidences(evidence_id) ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS idx_finding_evidences_finding ON finding_evidences(finding_id);
++CREATE INDEX IF NOT EXISTS idx_finding_evidences_evidence ON finding_evidences(evidence_id);
++
++CREATE TABLE IF NOT EXISTS hypothesis_evidences (
++    hypothesis_id TEXT NOT NULL,
++    evidence_id TEXT NOT NULL,
++    link_type TEXT CHECK(link_type IN ('SUPPORTING', 'CONTRADICTING')),
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++    PRIMARY KEY (hypothesis_id, evidence_id),
++    FOREIGN KEY (hypothesis_id) REFERENCES hypotheses(hypothesis_id) ON DELETE CASCADE,
++    FOREIGN KEY (evidence_id) REFERENCES evidences(evidence_id) ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS idx_hypothesis_evidences_hyp ON hypothesis_evidences(hypothesis_id);
+diff --git a/tests/test_evidence_engine.py b/tests/test_evidence_engine.py
+index 0723c3b..2ca3854 100644
+--- a/tests/test_evidence_engine.py
++++ b/tests/test_evidence_engine.py
+@@ -353,5 +353,137 @@ class TestFindingAddVersion(unittest.TestCase):
+         self.assertIn("timestamp", snap)
+ 
+ 
++class TestSubmitFindingJunctionLinking(unittest.TestCase):
++    """Tests for submit_finding() populating the finding_evidences junction
++    table (MTKLAB-008), on top of the deprecated evidence_ids_json array."""
++
++    def setUp(self):
++        self.temp_dir = tempfile.TemporaryDirectory()
++        self.db_path = Path(self.temp_dir.name) / "test_engine.db"
++        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
++
++    def tearDown(self):
++        self.temp_dir.cleanup()
++
++    def _create_sample_experiment(self, db: EvidenceDatabase, exp_id: str = "exp01"):
++        res = ExperimentResult(experiment_id=exp_id, status="success", summary="sample")
++        res.mark_completed()
++        db.store_experiment_result(res)
++
++    def _make_finding(self, **kwargs) -> Finding:
++        defaults = {
++            "experiment_id": "exp01",
++            "kind": FindingKind.REGION,
++            "offset": 0,
++            "size": 0x100,
++            "confidence": ConfidenceLevel.CANDIDATE,
++            "label": "Test Region",
++            "description": "A test region finding",
++        }
++        defaults.update(kwargs)
++        return Finding(**defaults)
++
++    def _make_evidence(self, **kwargs) -> Evidence:
++        defaults = {
++            "experiment_id": "exp01",
++            "evidence_type": EvidenceType.SIGNATURE_MATCH,
++            "confidence": ConfidenceLevel.CANDIDATE,
++            "description": "supporting evidence",
++        }
++        defaults.update(kwargs)
++        return Evidence(**defaults)
++
++    def test_submit_finding_with_evidence_populates_junction_table(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        engine = EvidenceEngine(db)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            ev1 = self._make_evidence(description="ev1")
++            ev2 = self._make_evidence(description="ev2", data={"tag": "b"})
++
++            result = engine.submit_finding(finding, [ev1, ev2])
++
++            linked = db.get_evidences_for_finding(result.finding_id)
++            self.assertEqual(
++                {e.evidence_id for e in linked},
++                {ev1.evidence_id, ev2.evidence_id},
++            )
++        finally:
++            db.close()
++
++    def test_submit_finding_no_evidence_does_not_error(self):
++        """Edge case: evidence_ids is empty -> safe no-op (section 8)."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        engine = EvidenceEngine(db)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            result = engine.submit_finding(finding, [])
++            self.assertEqual(db.get_evidences_for_finding(result.finding_id), [])
++        finally:
++            db.close()
++
++    def test_resubmitting_unchanged_finding_still_links_new_evidence(self):
++        """Regression guard for the early-return dedup path: when content
++        is unchanged, submit_finding() returns the EXISTING finding without
++        creating a new DB row (MTKLAB-004) -- but any newly-submitted
++        evidence is still persisted (step 2) and must still be linked to
++        `existing.finding_id`, not silently dropped from the junction
++        table just because no new finding row was written."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        engine = EvidenceEngine(db)
++        try:
++            self._create_sample_experiment(db)
++
++            finding_v1 = self._make_finding()
++            ev1 = self._make_evidence(description="first submission evidence")
++            result_v1 = engine.submit_finding(finding_v1, [ev1])
++
++            # Re-submit an identical (same logical_id, same content) finding
++            # with ADDITIONAL new evidence.
++            finding_v2 = self._make_finding()
++            ev2 = self._make_evidence(description="second submission evidence")
++            result_v2 = engine.submit_finding(finding_v2, [ev2])
++
++            # Dedup: same finding_id returned, no duplicate row created.
++            self.assertEqual(result_v1.finding_id, result_v2.finding_id)
++
++            # Both evidence items must be linked to that one finding_id.
++            linked = db.get_evidences_for_finding(result_v1.finding_id)
++            self.assertEqual(
++                {e.evidence_id for e in linked},
++                {ev1.evidence_id, ev2.evidence_id},
++            )
++        finally:
++            db.close()
++
++    def test_content_modified_links_evidence_to_new_finding_id(self):
++        """When content changes, submit_finding() mints a new finding_id
++        (MTKLAB-004) -- evidence submitted alongside the change must link
++        to that NEW finding_id."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        engine = EvidenceEngine(db)
++        try:
++            self._create_sample_experiment(db)
++
++            finding_v1 = self._make_finding()
++            ev1 = self._make_evidence(description="v1 evidence")
++            result_v1 = engine.submit_finding(finding_v1, [ev1])
++
++            finding_v2 = self._make_finding(label="Changed Label")
++            ev2 = self._make_evidence(description="v2 evidence")
++            result_v2 = engine.submit_finding(finding_v2, [ev2])
++
++            self.assertNotEqual(result_v1.finding_id, result_v2.finding_id)
++
++            linked_v1 = {e.evidence_id for e in db.get_evidences_for_finding(result_v1.finding_id)}
++            linked_v2 = {e.evidence_id for e in db.get_evidences_for_finding(result_v2.finding_id)}
++            self.assertEqual(linked_v1, {ev1.evidence_id})
++            self.assertEqual(linked_v2, {ev2.evidence_id})
++        finally:
++            db.close()
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 3b28841..7040406 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -75,10 +75,13 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+         migrator = MigrationManager(conn, self.migrations_dir)
+         migrator.apply_migrations()
+ 
+-        # Check applied migrations
++        # Check applied migrations. All pending migrations get applied
++        # (001 was already present, 002 and 003 -- junction tables,
++        # MTKLAB-007 -- were both pending), not just 002; that's the
++        # correct, intended behavior of apply_migrations().
+         cursor = conn.execute("SELECT version FROM schema_migrations ORDER BY version")
+         versions = [row[0] for row in cursor.fetchall()]
+-        self.assertEqual(versions, [1, 2])
++        self.assertEqual(versions, [1, 2, 3])
+ 
+         # Verify logical_id column exists
+         cursor = conn.execute("PRAGMA table_info(findings)")
+@@ -90,6 +93,15 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+         idx_row = cursor.fetchone()
+         self.assertIsNotNone(idx_row)
+ 
++        # Verify migration 003 (MTKLAB-007) also ran as part of the same
++        # full pipeline: junction tables must now exist.
++        cursor = conn.execute(
++            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
++            "('finding_evidences', 'hypothesis_evidences')"
++        )
++        junction_tables = {row[0] for row in cursor.fetchall()}
++        self.assertEqual(junction_tables, {"finding_evidences", "hypothesis_evidences"})
++
+         # Query existing finding inserted before migration
+         cursor = conn.execute("SELECT finding_id, logical_id FROM findings WHERE finding_id = 'f1'")
+         row = cursor.fetchone()
+@@ -540,6 +552,171 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
+             db.close()
+ 
+ 
++class TestJunctionTables(unittest.TestCase):
++    """Tests for the finding_evidences / hypothesis_evidences junction
++    tables (MTKLAB-007 migration + MTKLAB-008 link_finding_evidences() /
++    get_evidences_for_finding())."""
++
++    def setUp(self):
++        self.temp_dir = tempfile.TemporaryDirectory()
++        self.db_path = Path(self.temp_dir.name) / "test_evidence.db"
++        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
++
++    def tearDown(self):
++        self.temp_dir.cleanup()
++
++    def _create_sample_experiment(self, db: EvidenceDatabase, exp_id: str = "exp01"):
++        res = ExperimentResult(experiment_id=exp_id, status="success", summary="sample")
++        res.mark_completed()
++        db.store_experiment_result(res)
++
++    def _make_finding(self, experiment_id="exp01", **overrides):
++        kwargs = dict(
++            finding_id=str(uuid.uuid4()),
++            experiment_id=experiment_id,
++            kind=FindingKind.REGION,
++            offset=0,
++            size=100,
++            confidence=ConfidenceLevel.CANDIDATE,
++            description="test finding",
++        )
++        kwargs.update(overrides)
++        return Finding(**kwargs)
++
++    def _make_evidence(self, experiment_id="exp01", **overrides):
++        kwargs = dict(
++            evidence_id=str(uuid.uuid4()),
++            experiment_id=experiment_id,
++            evidence_type=EvidenceType.SIGNATURE_MATCH,
++            confidence=ConfidenceLevel.CANDIDATE,
++            description="test evidence",
++        )
++        kwargs.update(overrides)
++        return Evidence(**kwargs)
++
++    def test_link_finding_evidences_empty_list_is_a_safe_noop(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            db.link_finding_evidences(finding.finding_id, [])  # must not raise
++            self.assertEqual(db.get_evidences_for_finding(finding.finding_id), [])
++        finally:
++            db.close()
++
++    def test_link_finding_evidences_populates_junction_table(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++
++            ev1 = self._make_evidence(description="first")
++            ev2 = self._make_evidence(description="second")
++            db.store_evidence(ev1)
++            db.store_evidence(ev2)
++
++            db.link_finding_evidences(finding.finding_id, [ev1.evidence_id, ev2.evidence_id])
++
++            cursor = db._conn.execute(
++                "SELECT COUNT(*) AS c FROM finding_evidences WHERE finding_id = ?",
++                (finding.finding_id,),
++            )
++            self.assertEqual(cursor.fetchone()["c"], 2)
++        finally:
++            db.close()
++
++    def test_link_finding_evidences_is_idempotent(self):
++        """Re-linking an already-linked pair (composite PRIMARY KEY +
++        INSERT OR IGNORE) must not raise or duplicate the row."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            ev = self._make_evidence()
++            db.store_evidence(ev)
++
++            db.link_finding_evidences(finding.finding_id, [ev.evidence_id])
++            db.link_finding_evidences(finding.finding_id, [ev.evidence_id])  # again
++
++            cursor = db._conn.execute(
++                "SELECT COUNT(*) AS c FROM finding_evidences WHERE finding_id = ? AND evidence_id = ?",
++                (finding.finding_id, ev.evidence_id),
++            )
++            self.assertEqual(cursor.fetchone()["c"], 1)
++        finally:
++            db.close()
++
++    def test_get_evidences_for_finding_returns_full_evidence_objects(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            ev = self._make_evidence(description="linked evidence", data={"k": "v"})
++            db.store_evidence(ev)
++            db.link_finding_evidences(finding.finding_id, [ev.evidence_id])
++
++            results = db.get_evidences_for_finding(finding.finding_id)
++            self.assertEqual(len(results), 1)
++            self.assertEqual(results[0].evidence_id, ev.evidence_id)
++            self.assertEqual(results[0].description, "linked evidence")
++            self.assertEqual(results[0].data, {"k": "v"})
++        finally:
++            db.close()
++
++    def test_get_evidences_for_finding_empty_when_unlinked(self):
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            # Evidence exists but was never linked to this finding.
++            ev = self._make_evidence()
++            db.store_evidence(ev)
++
++            self.assertEqual(db.get_evidences_for_finding(finding.finding_id), [])
++        finally:
++            db.close()
++
++    def test_finding_evidences_foreign_key_enforced(self):
++        """Linking a nonexistent evidence_id must raise under
++        PRAGMA foreign_keys=ON (set in EvidenceDatabase.__init__)."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            with self.assertRaises(sqlite3.IntegrityError):
++                db.link_finding_evidences(finding.finding_id, ["does-not-exist"])
++        finally:
++            db.close()
++
++    def test_finding_cascade_delete_removes_junction_rows(self):
++        """ON DELETE CASCADE on finding_evidences.finding_id."""
++        db = EvidenceDatabase(self.db_path, self.migrations_dir)
++        try:
++            self._create_sample_experiment(db)
++            finding = self._make_finding()
++            db.store_finding(finding)
++            ev = self._make_evidence()
++            db.store_evidence(ev)
++            db.link_finding_evidences(finding.finding_id, [ev.evidence_id])
++
++            db._conn.execute("DELETE FROM findings WHERE finding_id = ?", (finding.finding_id,))
++            db._conn.commit()
++
++            cursor = db._conn.execute(
++                "SELECT COUNT(*) AS c FROM finding_evidences WHERE finding_id = ?",
++                (finding.finding_id,),
++            )
++            self.assertEqual(cursor.fetchone()["c"], 0)
++        finally:
++            db.close()
++
++
+ if __name__ == "__main__":
+     unittest.main()
+ 

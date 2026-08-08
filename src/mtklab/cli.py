@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -314,21 +316,35 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
     if dry_run:
         console.print("[yellow]Dry run - not executing.[/yellow]")
         return
-    
+
+    # --- MTKLAB-010: create the parent run record before executing anything.
+    # Foreign key from experiment_runs.run_id requires this row to exist
+    # first (PRAGMA foreign_keys=ON, see EvidenceDatabase.__init__).
+    run_id = str(uuid.uuid4())
+    proj.db.create_run(
+        run_id,
+        project_id=project,
+        command=" ".join(sys.argv),
+        config={"experiment_ids": list(experiment_ids), "run_all": run_all, "dry_run": dry_run},
+    )
+
     # Execute experiments
     engine = EvidenceEngine(proj.db)
     
     for i, exp_id in enumerate(order):
         exp = registry._experiments[exp_id]
         console.print(f"\n[cyan][{i+1}/{len(order)}] Running {exp_id}...[/cyan]")
-        
+
+        start_time = time.time()
         try:
             # Prepare context with dependencies
             ctx = registry.prepare_context(exp_id, proj.create_experiment_context(exp_id))
-            
+            ctx.run_id = run_id
+
             # Run experiment
             result = exp.run(ctx)
             result.mark_completed()
+            duration = time.time() - start_time
             
             # Store experiment result first so foreign keys reference a valid experiment row
             proj.db.store_experiment_result(result)
@@ -347,8 +363,45 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
                 proj.db.store_artifact_reference(exp_id, artifact_type, path, f"Artifact from {exp_id}")
             
             console.print(f"  [green]✓ {exp_id}[/green] - {result.status}: {result.summary}")
-            
+
+            # MTKLAB-010: record this experiment's outcome in experiment_runs.
+            # result.status is "success"/"partial"/"failed"; recorded
+            # uppercased (SUCCESS/PARTIAL/FAILED) -- PARTIAL is an
+            # application-level extension beyond the SUCCESS/FAILED/
+            # CANCELLED/RUNNING examples in MTKLAB-009 sec. 8, which
+            # explicitly leaves status unconstrained at the DB level.
+            #
+            # Note: a "failed" ExperimentResult here did NOT raise --
+            # experiments commonly return status="failed" with a populated
+            # `errors` list (e.g. exp01/exp02's "REE payload not found")
+            # rather than raising an uncaught exception. That is a distinct
+            # path from the `except Exception` branch below, so
+            # error_message must be captured here too or it silently stays
+            # NULL for the most common real-world failure shape.
+            proj.db.record_experiment_run(
+                run_id, exp_id,
+                status=result.status.upper(),
+                duration_seconds=duration,
+                error_message="; ".join(result.errors) if result.errors else None,
+                metrics={"findings": len(result.findings), "evidences": len(result.evidences)},
+            )
+
+        except KeyboardInterrupt:
+            # MTKLAB-010 edge case: Ctrl+C during an experiment records
+            # CANCELLED for the in-flight experiment (not yet-unstarted
+            # ones -- the run stops here) and exits cleanly rather than
+            # dumping a raw traceback.
+            duration = time.time() - start_time
+            console.print(f"\n  [yellow]⚠ {exp_id}[/yellow] - cancelled by user")
+            proj.db.record_experiment_run(
+                run_id, exp_id, status="CANCELLED", duration_seconds=duration,
+                error_message="Cancelled by user (SIGINT)",
+            )
+            console.print("[yellow]Run cancelled.[/yellow]")
+            sys.exit(130)  # conventional exit code for SIGINT
+
         except Exception as e:
+            duration = time.time() - start_time
             logger.exception(f"Experiment {exp_id} failed")
             console.print(f"  [red]✗ {exp_id}[/red] - failed: {e}")
             # Store failed result
@@ -361,6 +414,13 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
             )
             failed_result.mark_completed()
             proj.db.store_experiment_result(failed_result)
+
+            # MTKLAB-010: record the failure in experiment_runs, capturing
+            # the exception message as error_message.
+            proj.db.record_experiment_run(
+                run_id, exp_id, status="FAILED", duration_seconds=duration,
+                error_message=str(e),
+            )
     
     console.print("\n[bold green]All experiments completed.[/bold green]")
 
@@ -395,7 +455,8 @@ def list_experiments(project: str):
 @click.option("--project", "-p", required=True, help="Project name")
 @click.argument("experiment_id")
 def inspect(project: str, experiment_id: str):
-    """Show detailed JSON for an experiment result."""
+    """Show detailed JSON for an experiment result, or a finding's version
+    history when the argument matches a logical_id or finding_id instead."""
     proj = get_project(project)
     
     # Get experiment result from DB
@@ -403,9 +464,26 @@ def inspect(project: str, experiment_id: str):
         "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
     )
     row = cursor.fetchone()
-    
+
     if not row:
-        console.print(f"[red]Experiment '{experiment_id}' not found in project '{project}'.[/red]")
+        # MTKLAB-011: not an experiment_id -- try it as a finding lookup
+        # instead (logical_id first, then legacy finding_id UUID), before
+        # falling back to the original "not found" error. Tried in this
+        # order, not merged into one command signature change, to keep
+        # `mtklab inspect <experiment_id>` behaving exactly as before for
+        # anyone already relying on it -- the MTKLAB-011 spec text assumes
+        # `inspect` already looked up findings, which is not the case in
+        # this codebase; see accompanying report for details.
+        finding = proj.db.get_latest_finding_by_logical_id(experiment_id)
+        if finding is None:
+            finding = proj.db.get_finding(experiment_id)
+        if finding is not None:
+            _inspect_finding(proj, finding)
+            return
+        console.print(
+            f"[red]No experiment, logical_id, or finding_id matching "
+            f"'{experiment_id}' found in project '{project}'.[/red]"
+        )
         sys.exit(1)
     
     from mtklab.utils import json as json_utils
@@ -434,7 +512,41 @@ def inspect(project: str, experiment_id: str):
     
     result["findings"] = findings
     
-    console.print(json_utils.dumps(result, indent=2))
+    console.print(json_utils.dumps(result, indent=2), soft_wrap=True)
+
+
+def _inspect_finding(proj: Project, finding) -> None:
+    """MTKLAB-011: render a finding's full version timeline plus its
+    content-addressed evidence (via the finding_evidences junction table,
+    MTKLAB-008), for `mtklab inspect <logical_id_or_finding_id>`."""
+    from mtklab.utils import json as json_utils
+
+    evidences = proj.db.get_evidences_for_finding(finding.finding_id)
+
+    result = {
+        "finding_id": finding.finding_id,
+        "logical_id": finding.logical_id,
+        "experiment_id": finding.experiment_id,
+        "kind": finding.kind.value if hasattr(finding.kind, "value") else str(finding.kind),
+        "offset": finding.offset,
+        "size": finding.size,
+        "confidence": finding.confidence.name,
+        "label": finding.label,
+        "description": finding.description,
+        "version_count": len(finding.versions),
+        "versions": finding.versions,
+        "evidence": [
+            {
+                "evidence_id": e.evidence_id,
+                "evidence_type": str(e.evidence_type),
+                "confidence": e.confidence.name,
+                "description": e.description,
+                "data": e.data,
+            }
+            for e in evidences
+        ],
+    }
+    console.print(json_utils.dumps(result, indent=2), soft_wrap=True)
 
 
 @cli.command()
@@ -462,16 +574,35 @@ def status(project: str):
     # Hypothesis counts
     cursor = proj.db._conn.execute("SELECT status, COUNT(*) as cnt FROM hypotheses GROUP BY status")
     hyp_stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
-    
+
+    # MTKLAB-011: run count and unique logical_id count. Both are simple
+    # COUNT queries -- naturally 0 on an empty/fresh project database
+    # rather than raising (edge case sec. 8: "zero runs or zero findings").
+    run_count = proj.db.count_runs()
+    cursor = proj.db._conn.execute(
+        "SELECT COUNT(DISTINCT logical_id) as cnt FROM findings WHERE logical_id IS NOT NULL"
+    )
+    logical_finding_count = cursor.fetchone()["cnt"]
+
+    # Confidence breakdown across the three lifecycle levels (RFC.md 4.1),
+    # explicitly zero-filled so the summary is stable even before any
+    # findings of a given confidence exist.
+    confidence_breakdown = "\n".join(
+        f"  {level}: {find_stats.get(level, 0)}"
+        for level in ("CANDIDATE", "PROBABLE", "VERIFIED")
+    )
+
     console.print(Panel.fit(
         f"[bold]Project:[/bold] {project}\n"
         f"[bold]Directory:[/bold] {proj.project_dir}\n"
         f"[bold]Firmware:[/bold] {proj.get_firmware_path()}\n"
         f"[bold]REE Payload:[/bold] {proj.get_ree_payload_path()}\n\n"
+        f"[bold]Runs:[/bold] {run_count} total\n\n"
         f"[bold]Experiments:[/bold] {sum(exp_stats.values())} total\n"
         + "\n".join(f"  {k}: {v}" for k, v in exp_stats.items()) + "\n\n"
-        f"[bold]Findings:[/bold] {sum(find_stats.values())} total\n"
-        + "\n".join(f"  {k}: {v}" for k, v in find_stats.items()) + "\n\n"
+        f"[bold]Findings:[/bold] {sum(find_stats.values())} total "
+        f"({logical_finding_count} unique logical_id)\n"
+        f"{confidence_breakdown}\n\n"
         f"[bold]Hypotheses:[/bold] {sum(hyp_stats.values())} total\n"
         + "\n".join(f"  {k}: {v}" for k, v in hyp_stats.items()),
         title="Project Status",

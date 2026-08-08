@@ -1,5 +1,6 @@
 """Migration, foreign key enforcement, and storage tests for EvidenceDatabase."""
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -76,12 +77,11 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
         migrator.apply_migrations()
 
         # Check applied migrations. All pending migrations get applied
-        # (001 was already present, 002 and 003 -- junction tables,
-        # MTKLAB-007 -- were both pending), not just 002; that's the
-        # correct, intended behavior of apply_migrations().
+        # (001 was already present, 002/003/004 were pending), not just
+        # 002; that's the correct, intended behavior of apply_migrations().
         cursor = conn.execute("SELECT version FROM schema_migrations ORDER BY version")
         versions = [row[0] for row in cursor.fetchall()]
-        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(versions, [1, 2, 3, 4])
 
         # Verify logical_id column exists
         cursor = conn.execute("PRAGMA table_info(findings)")
@@ -101,6 +101,13 @@ class TestStorageMigrationsAndOperations(unittest.TestCase):
         )
         junction_tables = {row[0] for row in cursor.fetchall()}
         self.assertEqual(junction_tables, {"finding_evidences", "hypothesis_evidences"})
+
+        # Verify migration 004 (MTKLAB-009) also ran: run-tracking tables.
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('runs', 'experiment_runs')"
+        )
+        run_tables = {row[0] for row in cursor.fetchall()}
+        self.assertEqual(run_tables, {"runs", "experiment_runs"})
 
         # Query existing finding inserted before migration
         cursor = conn.execute("SELECT finding_id, logical_id FROM findings WHERE finding_id = 'f1'")
@@ -713,6 +720,111 @@ class TestJunctionTables(unittest.TestCase):
                 (finding.finding_id,),
             )
             self.assertEqual(cursor.fetchone()["c"], 0)
+        finally:
+            db.close()
+
+
+class TestRunTracking(unittest.TestCase):
+    """Tests for the runs / experiment_runs tables (MTKLAB-009 migration)
+    and create_run() / record_experiment_run() (MTKLAB-010)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_runs.db"
+        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_create_run_inserts_row(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            db.create_run("run1", project_id="test_project", command="mtklab run --all", config={"x": 1})
+            cursor = db._conn.execute("SELECT * FROM runs WHERE run_id = ?", ("run1",))
+            row = cursor.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["project_id"], "test_project")
+            self.assertEqual(row["command"], "mtklab run --all")
+            self.assertEqual(json.loads(row["config_json"]), {"x": 1})
+        finally:
+            db.close()
+
+    def test_count_runs(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self.assertEqual(db.count_runs(), 0)
+            db.create_run("run1", project_id="p")
+            db.create_run("run2", project_id="p")
+            self.assertEqual(db.count_runs(), 2)
+        finally:
+            db.close()
+
+    def test_record_experiment_run_success(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            db.create_run("run1", project_id="p")
+            exp_run_id = db.record_experiment_run(
+                "run1", "exp01_entropy_landscape", status="SUCCESS",
+                duration_seconds=1.23, metrics={"findings": 2},
+            )
+            self.assertIsInstance(exp_run_id, str)
+            rows = db.get_run_experiment_runs("run1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "SUCCESS")
+            self.assertEqual(rows[0]["duration_seconds"], 1.23)
+            self.assertIsNone(rows[0]["error_message"])
+        finally:
+            db.close()
+
+    def test_record_experiment_run_failure_captures_error_message(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            db.create_run("run1", project_id="p")
+            db.record_experiment_run(
+                "run1", "exp02_repeated_structures", status="FAILED",
+                error_message="boom: something broke",
+            )
+            rows = db.get_run_experiment_runs("run1")
+            self.assertEqual(rows[0]["status"], "FAILED")
+            self.assertEqual(rows[0]["error_message"], "boom: something broke")
+        finally:
+            db.close()
+
+    def test_record_experiment_run_requires_existing_run_id(self):
+        """FOREIGN KEY (run_id) REFERENCES runs(run_id) -- must raise for
+        a run_id that was never created via create_run()."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.record_experiment_run("nonexistent_run", "exp01", status="SUCCESS")
+        finally:
+            db.close()
+
+    def test_run_cascade_delete_removes_experiment_runs(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            db.create_run("run1", project_id="p")
+            db.record_experiment_run("run1", "exp01", status="SUCCESS")
+            db._conn.execute("DELETE FROM runs WHERE run_id = ?", ("run1",))
+            db._conn.commit()
+            self.assertEqual(db.get_run_experiment_runs("run1"), [])
+        finally:
+            db.close()
+
+    def test_full_migration_pipeline_001_through_004(self):
+        """Integration test (section 9): fresh DB gets all four migrations
+        and both new tables exist with correct schema."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            cursor = db._conn.execute("SELECT version FROM schema_migrations ORDER BY version")
+            self.assertEqual([r[0] for r in cursor.fetchall()], [1, 2, 3, 4])
+            cursor = db._conn.execute("PRAGMA table_info(experiment_runs)")
+            cols = {row[1] for row in cursor.fetchall()}
+            self.assertEqual(
+                cols,
+                {"experiment_run_id", "run_id", "experiment_id", "status",
+                 "error_message", "duration_seconds", "metrics_json", "created_at"},
+            )
         finally:
             db.close()
 
