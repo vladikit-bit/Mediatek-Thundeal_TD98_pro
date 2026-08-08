@@ -49,15 +49,22 @@ class EvidenceDatabase:
 
     # --- Evidence Operations ---
 
-    def store_evidence(self, evidence: Evidence) -> None:
-        """Store a single piece of evidence."""
+    def store_evidence(self, evidence: Evidence) -> bool:
+        """Store a single piece of evidence using INSERT OR IGNORE.
+
+        Returns True if a new row was inserted, False if it was ignored
+        because an evidence record with the same (content-addressed, since
+        MTKLAB-005) evidence_id already exists -- i.e. this exact evidence
+        was already recorded, possibly by an earlier run or experiment
+        (ADR-002 automatic deduplication).
+        """
         # Ensure UUIDs are strings
         if not isinstance(evidence.evidence_id, str):
             evidence.evidence_id = str(evidence.evidence_id)
             
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO evidences (
                     evidence_id, experiment_id, evidence_type, confidence, 
@@ -78,6 +85,7 @@ class EvidenceDatabase:
                     evidence.timestamp.isoformat(),
                 )
             )
+            return cursor.rowcount > 0
 
     def get_evidence(self, evidence_id: str) -> Optional[Evidence]:
         """Retrieve evidence by ID."""
@@ -101,6 +109,59 @@ class EvidenceDatabase:
             tags=json.loads(row["tags_json"]),
             timestamp=datetime.fromisoformat(row["timestamp"])
         )
+
+    # --- Junction Operations (MTKLAB-007/008) ---
+
+    def link_finding_evidences(self, finding_id: str, evidence_ids: List[str]) -> None:
+        """Record finding<->evidence links in the normalized junction table.
+
+        Both finding_id and every evidence_id must already exist in their
+        respective tables (finding_evidences has ON DELETE CASCADE foreign
+        keys to findings/evidences, and PRAGMA foreign_keys=ON is set on
+        this connection -- see __init__), so this must only be called after
+        store_finding()/store_evidence() for the referenced rows. Safe to
+        call with an empty list (no-ops). INSERT OR IGNORE makes re-linking
+        an already-linked pair a harmless no-op, matching the composite
+        PRIMARY KEY (finding_id, evidence_id).
+        """
+        if not evidence_ids:
+            return
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for eid in evidence_ids:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO finding_evidences (finding_id, evidence_id) VALUES (?, ?)",
+                    (finding_id, str(eid)),
+                )
+
+    def get_evidences_for_finding(self, finding_id: str) -> List[Evidence]:
+        """Retrieve all evidence linked to a finding via the normalized
+        finding_evidences junction table (MTKLAB-008), not the deprecated
+        evidence_ids_json column on findings."""
+        cursor = self._conn.execute(
+            """
+            SELECT e.* FROM evidences e
+            JOIN finding_evidences fe ON fe.evidence_id = e.evidence_id
+            WHERE fe.finding_id = ?
+            ORDER BY fe.created_at
+            """,
+            (finding_id,),
+        )
+        return [
+            Evidence(
+                evidence_id=row["evidence_id"],
+                experiment_id=row["experiment_id"],
+                evidence_type=EvidenceType(row["evidence_type"]),
+                confidence=ConfidenceLevel[row["confidence"]],
+                description=row["description"],
+                data=json.loads(row["data_json"]),
+                source_offset=row["source_offset"],
+                source_size=row["source_size"],
+                tags=json.loads(row["tags_json"]),
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+            )
+            for row in cursor.fetchall()
+        ]
 
     # --- Finding Operations ---
 

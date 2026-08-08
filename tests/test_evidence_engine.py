@@ -353,5 +353,137 @@ class TestFindingAddVersion(unittest.TestCase):
         self.assertIn("timestamp", snap)
 
 
+class TestSubmitFindingJunctionLinking(unittest.TestCase):
+    """Tests for submit_finding() populating the finding_evidences junction
+    table (MTKLAB-008), on top of the deprecated evidence_ids_json array."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_engine.db"
+        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _create_sample_experiment(self, db: EvidenceDatabase, exp_id: str = "exp01"):
+        res = ExperimentResult(experiment_id=exp_id, status="success", summary="sample")
+        res.mark_completed()
+        db.store_experiment_result(res)
+
+    def _make_finding(self, **kwargs) -> Finding:
+        defaults = {
+            "experiment_id": "exp01",
+            "kind": FindingKind.REGION,
+            "offset": 0,
+            "size": 0x100,
+            "confidence": ConfidenceLevel.CANDIDATE,
+            "label": "Test Region",
+            "description": "A test region finding",
+        }
+        defaults.update(kwargs)
+        return Finding(**defaults)
+
+    def _make_evidence(self, **kwargs) -> Evidence:
+        defaults = {
+            "experiment_id": "exp01",
+            "evidence_type": EvidenceType.SIGNATURE_MATCH,
+            "confidence": ConfidenceLevel.CANDIDATE,
+            "description": "supporting evidence",
+        }
+        defaults.update(kwargs)
+        return Evidence(**defaults)
+
+    def test_submit_finding_with_evidence_populates_junction_table(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        engine = EvidenceEngine(db)
+        try:
+            self._create_sample_experiment(db)
+            finding = self._make_finding()
+            ev1 = self._make_evidence(description="ev1")
+            ev2 = self._make_evidence(description="ev2", data={"tag": "b"})
+
+            result = engine.submit_finding(finding, [ev1, ev2])
+
+            linked = db.get_evidences_for_finding(result.finding_id)
+            self.assertEqual(
+                {e.evidence_id for e in linked},
+                {ev1.evidence_id, ev2.evidence_id},
+            )
+        finally:
+            db.close()
+
+    def test_submit_finding_no_evidence_does_not_error(self):
+        """Edge case: evidence_ids is empty -> safe no-op (section 8)."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        engine = EvidenceEngine(db)
+        try:
+            self._create_sample_experiment(db)
+            finding = self._make_finding()
+            result = engine.submit_finding(finding, [])
+            self.assertEqual(db.get_evidences_for_finding(result.finding_id), [])
+        finally:
+            db.close()
+
+    def test_resubmitting_unchanged_finding_still_links_new_evidence(self):
+        """Regression guard for the early-return dedup path: when content
+        is unchanged, submit_finding() returns the EXISTING finding without
+        creating a new DB row (MTKLAB-004) -- but any newly-submitted
+        evidence is still persisted (step 2) and must still be linked to
+        `existing.finding_id`, not silently dropped from the junction
+        table just because no new finding row was written."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        engine = EvidenceEngine(db)
+        try:
+            self._create_sample_experiment(db)
+
+            finding_v1 = self._make_finding()
+            ev1 = self._make_evidence(description="first submission evidence")
+            result_v1 = engine.submit_finding(finding_v1, [ev1])
+
+            # Re-submit an identical (same logical_id, same content) finding
+            # with ADDITIONAL new evidence.
+            finding_v2 = self._make_finding()
+            ev2 = self._make_evidence(description="second submission evidence")
+            result_v2 = engine.submit_finding(finding_v2, [ev2])
+
+            # Dedup: same finding_id returned, no duplicate row created.
+            self.assertEqual(result_v1.finding_id, result_v2.finding_id)
+
+            # Both evidence items must be linked to that one finding_id.
+            linked = db.get_evidences_for_finding(result_v1.finding_id)
+            self.assertEqual(
+                {e.evidence_id for e in linked},
+                {ev1.evidence_id, ev2.evidence_id},
+            )
+        finally:
+            db.close()
+
+    def test_content_modified_links_evidence_to_new_finding_id(self):
+        """When content changes, submit_finding() mints a new finding_id
+        (MTKLAB-004) -- evidence submitted alongside the change must link
+        to that NEW finding_id."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        engine = EvidenceEngine(db)
+        try:
+            self._create_sample_experiment(db)
+
+            finding_v1 = self._make_finding()
+            ev1 = self._make_evidence(description="v1 evidence")
+            result_v1 = engine.submit_finding(finding_v1, [ev1])
+
+            finding_v2 = self._make_finding(label="Changed Label")
+            ev2 = self._make_evidence(description="v2 evidence")
+            result_v2 = engine.submit_finding(finding_v2, [ev2])
+
+            self.assertNotEqual(result_v1.finding_id, result_v2.finding_id)
+
+            linked_v1 = {e.evidence_id for e in db.get_evidences_for_finding(result_v1.finding_id)}
+            linked_v2 = {e.evidence_id for e in db.get_evidences_for_finding(result_v2.finding_id)}
+            self.assertEqual(linked_v1, {ev1.evidence_id})
+            self.assertEqual(linked_v2, {ev2.evidence_id})
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

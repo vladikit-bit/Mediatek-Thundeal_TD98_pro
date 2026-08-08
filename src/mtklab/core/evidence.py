@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,7 +72,16 @@ class FindingKind(Enum):
 class Evidence:
     """Single piece of evidence supporting/refuting a hypothesis."""
 
-    evidence_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # None by default (not a random UUID via default_factory) so
+    # __post_init__ can distinguish "not explicitly provided" and populate
+    # it with a deterministic content hash instead (MTKLAB-005 / ADR-002).
+    # Every current reconstruction path (from_dict's required "evidence_id"
+    # key, db.get_evidence()'s NOT-NULL-in-practice primary key column)
+    # always supplies a real, non-None value explicitly, so this does not
+    # carry the same reconstruction-path risk that Finding.logical_id's
+    # auto-population had (see MTKLAB-002): there is no legacy NULL
+    # evidence_id anywhere to accidentally overwrite.
+    evidence_id: str | None = None
     experiment_id: str = ""
     evidence_type: EvidenceType = EvidenceType.SIGNATURE_MATCH
     confidence: ConfidenceLevel = ConfidenceLevel.CANDIDATE
@@ -80,6 +91,26 @@ class Evidence:
     source_size: int | None = None
     tags: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    def __post_init__(self):
+        if self.evidence_id is None:
+            self.evidence_id = self.compute_content_hash()
+
+    def compute_content_hash(self) -> str:
+        """Compute a deterministic SHA-256 hash of this evidence's payload.
+
+        Two Evidence objects with identical (experiment_id, evidence_type,
+        source_offset, source_size, data) hash identically regardless of
+        when they were created or in what dict-key order `data` happens to
+        be -- this is what lets storage-layer INSERT OR IGNORE (MTKLAB-006)
+        naturally deduplicate the same evidence submitted across multiple
+        runs/experiments (ADR-002). `timestamp` is deliberately NOT part of
+        the hash: including it would make every submission unique and
+        defeat deduplication entirely.
+        """
+        data_str = json.dumps(self.data, sort_keys=True)
+        canonical = f"{self.experiment_id}:{self.evidence_type}:{self.source_offset}:{self.source_size}:{data_str}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -277,7 +308,8 @@ class EvidenceEngine:
            - Content Unchanged → return existing finding (no new DB record).
            - Content Modified → new finding_id UUID, increment version.
            - New Finding → version 1 from __post_init__.
-        5. **Persist** finding and update related hypotheses.
+        5. **Persist** finding, link evidence via the finding_evidences
+           junction table (MTKLAB-008), and update related hypotheses.
 
         Args:
             finding: The Finding to register.
@@ -306,7 +338,14 @@ class EvidenceEngine:
         # 4. Deduplication and versioning
         if existing:
             if self._is_finding_unchanged(existing, finding):
-                # Content unchanged — return existing finding without new DB record
+                # Content unchanged — return existing finding without new DB
+                # record. Any newly-submitted evidence was still persisted
+                # in step 2 above, so it must still be linked to the finding
+                # actually being returned (existing.finding_id), or it would
+                # be recorded in `evidences` but orphaned from
+                # `finding_evidences` (MTKLAB-008).
+                if finding.evidence_ids:
+                    self.db.link_finding_evidences(existing.finding_id, finding.evidence_ids)
                 return existing
             # Content modified — generate new finding_id and add version snapshot
             finding.finding_id = str(uuid.uuid4())
@@ -318,8 +357,10 @@ class EvidenceEngine:
             # Add submission snapshot to capture post-evidence confidence state
             finding.add_version("initial_submission")
 
-        # 5. Store finding and update hypotheses
+        # 5. Store finding, link its evidence, and update hypotheses
         self.db.store_finding(finding)
+        if finding.evidence_ids:
+            self.db.link_finding_evidences(finding.finding_id, finding.evidence_ids)
         self._update_hypotheses(finding)
 
         return finding
