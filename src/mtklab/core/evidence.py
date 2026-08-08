@@ -187,7 +187,20 @@ class Finding:
     # Versioned history - first-class feature
     versions: list[dict[str, Any]] = field(default_factory=list)
 
+    # MTKLAB-012: private construction-time sentinel. When True, deserialization
+    # paths (from_dict, EvidenceDatabase.get_finding) suppress __post_init__'s
+    # logical_id/version auto-generation entirely instead of letting it run
+    # and then overwriting the result -- avoids wasted computation on every
+    # row-to-object conversion, and removes the risk that a future
+    # deserialization path could forget the post-construction overwrite and
+    # silently fabricate a logical_id/version for a legacy record. Not
+    # domain data: excluded from repr/equality and never serialized by
+    # to_dict().
+    _from_storage: bool = field(default=False, repr=False, compare=False)
+
     def __post_init__(self):
+        if self._from_storage:
+            return
         if self.logical_id is None:
             self.logical_id = generate_logical_id(
                 self.experiment_id, str(self.kind), self.offset, self.size
@@ -265,7 +278,13 @@ class Finding:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Finding":
-        f = cls(
+        # MTKLAB-012: _from_storage=True suppresses __post_init__'s
+        # logical_id/version auto-generation entirely, so this restores
+        # exactly what was persisted -- including a missing/None logical_id
+        # for pre-MTKLAB-002 records -- in one shot, with no
+        # construct-then-overwrite step. See MTKLAB-001 edge cases and
+        # REVIEW_GUIDELINES.md 2.3 ("maintain default fallbacks for missing keys").
+        return cls(
             finding_id=d["finding_id"],
             experiment_id=d["experiment_id"],
             kind=FindingKind(d["kind"]),
@@ -276,16 +295,10 @@ class Finding:
             description=d.get("description", ""),
             evidence_ids=d.get("evidence_ids", []),
             metadata=d.get("metadata", {}),
+            logical_id=d.get("logical_id"),
+            versions=d.get("versions", []),
+            _from_storage=True,
         )
-        # Deserialization restores exactly what was persisted, including a
-        # missing/None logical_id for pre-MTKLAB-002 records. It must NOT go
-        # through the __post_init__ auto-generation path, or legacy records
-        # would silently acquire a fabricated logical_id that was never
-        # actually indexed/deduplicated on. See MTKLAB-001 edge cases and
-        # REVIEW_GUIDELINES.md 2.3 ("maintain default fallbacks for missing keys").
-        f.logical_id = d.get("logical_id")
-        f.versions = d.get("versions", [])
-        return f
 
 
 class EvidenceEngine:
