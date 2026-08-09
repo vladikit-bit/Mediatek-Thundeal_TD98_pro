@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Optional
 
 from mtklab.core.evidence import Evidence, EvidenceType, ConfidenceLevel
@@ -39,7 +38,6 @@ class MStarFirmwareMapAdapter:
             ev_type = self._map_kind_to_type(entry.kind)
             
             ev = Evidence(
-                evidence_id=str(uuid.uuid4()),
                 experiment_id=experiment_id,
                 evidence_type=ev_type,
                 confidence=ConfidenceLevel.PROBABLE if entry.confidence == "high" else ConfidenceLevel.CANDIDATE,

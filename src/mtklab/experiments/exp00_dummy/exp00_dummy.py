@@ -45,7 +45,6 @@ class Exp00Dummy(Experiment):
             
             # Create supporting evidence
             evidence = Evidence(
-                evidence_id=str(uuid.uuid4()),
                 experiment_id=self.experiment_id,
                 evidence_type=EvidenceType.MANUAL_ANNOTATION,
                 confidence=ConfidenceLevel.CANDIDATE,

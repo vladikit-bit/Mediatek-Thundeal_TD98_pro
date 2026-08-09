@@ -206,7 +206,6 @@ class Exp02RepeatedStructures(Experiment):
 
                             # Evidence for this table
                             evidence = Evidence(
-                                evidence_id=str(uuid.uuid4()),
                                 experiment_id=self.experiment_id,
                                 evidence_type=EvidenceType.STRUCTURAL_PATTERN,
                                 confidence=ConfidenceLevel.CANDIDATE,

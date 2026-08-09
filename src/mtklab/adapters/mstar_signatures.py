@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Optional
 
 from mtklab.core.evidence import Evidence, EvidenceType, ConfidenceLevel
@@ -67,7 +66,6 @@ class MStarSignaturesAdapter:
             }
             
             ev = Evidence(
-                evidence_id=str(uuid.uuid4()),
                 experiment_id=experiment_id,
                 evidence_type=EvidenceType.SIGNATURE_MATCH,
                 confidence=conf_map.get(f.confidence, ConfidenceLevel.CANDIDATE),
@@ -86,7 +84,6 @@ class MStarSignaturesAdapter:
         for pattern, label in MTK_PATTERNS:
             for offset in iter_find(data, pattern):
                 ev = Evidence(
-                    evidence_id=str(uuid.uuid4()),
                     experiment_id=experiment_id,
                     evidence_type=EvidenceType.SIGNATURE_MATCH,
                     confidence=ConfidenceLevel.CANDIDATE,
@@ -118,7 +115,6 @@ class MStarSignaturesAdapter:
         for f in findings:
             conf_map = {"high": ConfidenceLevel.PROBABLE, "medium": ConfidenceLevel.CANDIDATE, "low": ConfidenceLevel.CANDIDATE}
             ev = Evidence(
-                evidence_id=str(uuid.uuid4()),
                 experiment_id=experiment_id,
                 evidence_type=EvidenceType.SIGNATURE_MATCH,
                 confidence=conf_map.get(f.confidence, ConfidenceLevel.CANDIDATE),

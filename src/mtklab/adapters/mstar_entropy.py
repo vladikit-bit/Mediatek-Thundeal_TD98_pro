@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,7 +117,6 @@ class MStarEntropyAdapter:
             cls = classify_region(points[i].entropy)
             if cls != cur_class:
                 ev = Evidence(
-                    evidence_id=str(uuid.uuid4()),
                     experiment_id=experiment_id,
                     evidence_type=EvidenceType.ENTROPY_BOUNDARY,
                     confidence=ConfidenceLevel.PROBABLE,
@@ -141,7 +139,6 @@ class MStarEntropyAdapter:
         # High-entropy regions
         for start, end in high_entropy_regions(points, threshold=self.config.high_entropy_threshold):
             ev = Evidence(
-                evidence_id=str(uuid.uuid4()),
                 experiment_id=experiment_id,
                 evidence_type=EvidenceType.ENTROPY_BOUNDARY,
                 confidence=ConfidenceLevel.CANDIDATE,
