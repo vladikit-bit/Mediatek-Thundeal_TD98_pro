@@ -221,6 +221,12 @@ class Exp02RepeatedStructures(Experiment):
                                 tags=["repeated_structure", f"size_{table['record_size']}"]
                             )
                             evidences.append(evidence)
+                            # Associate the evidence with the finding it
+                            # actually supports (this experiment can emit
+                            # many findings per run -- one per detected
+                            # table -- so each must only be linked to its
+                            # OWN evidence, not every table's evidence).
+                            finding.evidence_ids.append(evidence.evidence_id)
 
                     total_bytes_analyzed += region_bytes_analyzed
                     remaining_total_budget -= region_bytes_analyzed

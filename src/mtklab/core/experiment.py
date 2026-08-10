@@ -36,6 +36,38 @@ class ExperimentContext:
     # improvements over refactoring."
     run_id: str | None = None
 
+    def get_findings(
+        self, experiment_id: str | None = None, near_offset: int | None = None, radius: int = 0
+    ) -> list[Finding]:
+        """Query previously-persisted findings, optionally scoped to a
+        specific experiment_id and/or an offset window (`near_offset` +/-
+        `radius`). Implements the ctx.get_findings() capability documented
+        in docs/architecture/DOMAIN_API.md section 5 ("Inter-Experiment
+        Communication: Downstream experiments read persistent findings via
+        ctx.get_findings() or ctx.get_evidences()") -- documented there
+        since before this method actually existed.
+
+        Intended use: an experiment checking whether an offset it's
+        investigating was already reported by an earlier experiment in
+        this run (or a previous run), e.g. for corroboration --
+        `ctx.get_findings(near_offset=0x5950, radius=64)`. This is a
+        read-only query against already-committed data; it does not
+        replace or bypass EvidenceEngine.submit_finding()'s deduplication
+        for findings the CALLING experiment produces itself.
+        """
+        offset_range = (near_offset - radius, near_offset + radius + 1) if near_offset is not None else None
+        return self.evidence_db.query_findings(experiment_id=experiment_id, offset_range=offset_range)
+
+    def get_evidences(
+        self, experiment_id: str | None = None, near_offset: int | None = None, radius: int = 0
+    ) -> list[Evidence]:
+        """Query previously-persisted evidence, optionally scoped to a
+        specific experiment_id and/or an offset window. See get_findings()
+        docstring -- same DOMAIN_API.md section 5 capability, evidence
+        side."""
+        offset_range = (near_offset - radius, near_offset + radius + 1) if near_offset is not None else None
+        return self.evidence_db.query_evidences(experiment_id=experiment_id, offset_range=offset_range)
+
 
 @dataclass
 class ExperimentResult:

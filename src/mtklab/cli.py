@@ -353,7 +353,29 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
             if result.findings or result.evidences or result.hypotheses:
                 for finding in result.findings:
                     finding.experiment_id = exp_id
-                    engine.submit_finding(finding, result.evidences)
+                    # Scope submitted evidence to THIS finding via
+                    # finding.evidence_ids (populated by the experiment at
+                    # construction time), not the full result.evidences
+                    # pool. Passing the whole pool to every finding would
+                    # incorrectly link each finding to every OTHER
+                    # finding's evidence too whenever an experiment emits
+                    # more than one finding per run (e.g. exp02, one per
+                    # detected table) -- confirmed during development by
+                    # reproducing it directly against the DB. Evidence
+                    # objects the experiment produced but didn't associate
+                    # with any finding (finding.evidence_ids empty on all
+                    # findings) are still persisted below via
+                    # store_evidence, just not linked to a finding.
+                    relevant_evidence = [
+                        e for e in result.evidences if e.evidence_id in finding.evidence_ids
+                    ]
+                    engine.submit_finding(finding, relevant_evidence)
+                # Evidence not associated with any finding (if any) is
+                # still persisted for provenance/dedup, just unlinked.
+                linked_ids = {eid for f in result.findings for eid in f.evidence_ids}
+                for ev in result.evidences:
+                    if ev.evidence_id not in linked_ids:
+                        proj.db.store_evidence(ev)
                 for hyp in result.hypotheses:
                     hyp.hypothesis_id = hyp.hypothesis_id  # ensure set
                     proj.db.store_hypothesis(hyp)

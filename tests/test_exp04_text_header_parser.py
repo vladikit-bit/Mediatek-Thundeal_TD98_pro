@@ -1,11 +1,18 @@
 """Tests for exp04_text_header_parser.
 
-The primary fixture uses the EXACT byte content documented in
-config/firmware.yaml known_structures[text_header]
-("REE_OFFSET_START=0x1000, REE_OFFSET_LEN=0x5AEB0000"), so these tests
-double as a "framework discovers at least the documented known structures"
-regression check for this specific structure (MTKLAB-013 direction),
-without needing the real (multi-hundred-MB) firmware file.
+The primary fixture uses the ACTUAL byte content observed on the real
+Thundeal TD98 Pro upgrade_image.pkg during architecture review:
+
+    # REE_OFFSET_START = 0x1000 #
+    # REE_OFFSET_LEN = 0x5aeb0000 #
+
+not the comma-separated "KEY=VALUE, KEY2=VALUE2" format originally guessed
+from config/firmware.yaml's free-text description (config/firmware.yaml
+is a prior hypothesis, not ground truth -- real bytes take precedence).
+These tests double as a "framework discovers at least the documented known
+structures" regression check for this specific structure (MTKLAB-013
+direction), without needing the full real (multi-hundred-MB) firmware
+file.
 """
 
 import logging
@@ -34,6 +41,17 @@ class TestParseKeyValuePairs(unittest.TestCase):
 
     def test_parses_documented_real_header_exactly(self):
         pairs = self.exp._parse_key_value_pairs("REE_OFFSET_START=0x1000, REE_OFFSET_LEN=0x5AEB0000")
+        self.assertEqual(pairs, {"REE_OFFSET_START": 0x1000, "REE_OFFSET_LEN": 0x5AEB0000})
+
+    def test_parses_actual_real_firmware_format(self):
+        """The ACTUAL byte content observed on the real TD98 Pro
+        upgrade_image.pkg (not the comma-separated format originally
+        assumed from config/firmware.yaml's free-text description) --
+        confirmed during architecture review with real firmware bytes.
+        Regression guard: this must never regress back to only supporting
+        the originally-guessed format."""
+        real_text = "# REE_OFFSET_START = 0x1000 #\n# REE_OFFSET_LEN = 0x5aeb0000 #"
+        pairs = self.exp._parse_key_value_pairs(real_text)
         self.assertEqual(pairs, {"REE_OFFSET_START": 0x1000, "REE_OFFSET_LEN": 0x5AEB0000})
 
     def test_decimal_values_supported(self):
@@ -82,9 +100,11 @@ class TestExp04TextHeaderParser(unittest.TestCase):
         self.assertEqual(result.status, "success")
 
     def test_documented_header_matches_default_expected_hints(self):
-        """Byte-for-byte the real, documented text_header content."""
+        """The ACTUAL real text_header content (# KEY = VALUE # style,
+        newline-separated), not the originally-guessed comma format."""
         ota_path = self.tmpdir / "upgrade_image.pkg"
-        _build_ota_with_text_header(ota_path, b"REE_OFFSET_START=0x1000, REE_OFFSET_LEN=0x5AEB0000")
+        real_text = b"# REE_OFFSET_START = 0x1000 #\n# REE_OFFSET_LEN = 0x5aeb0000 #"
+        _build_ota_with_text_header(ota_path, real_text)
 
         result = Exp04TextHeaderParser().run(self._make_ctx(ota_path))
 

@@ -163,6 +163,79 @@ class EvidenceDatabase:
             for row in cursor.fetchall()
         ]
 
+    def query_findings(
+        self,
+        experiment_id: Optional[str] = None,
+        offset_range: Optional[tuple] = None,
+    ) -> List[Finding]:
+        """Query persisted findings, optionally filtered by experiment_id
+        and/or an [start, end) offset range (matches any finding whose own
+        [offset, offset+size) span overlaps the query range -- a finding
+        with size=None is treated as a point at `offset`).
+
+        Implements the ctx.get_findings() capability documented in
+        docs/architecture/DOMAIN_API.md section 5 ("Inter-Experiment
+        Communication") but not previously implemented -- see also
+        ExperimentContext.get_findings(), the thin wrapper experiments
+        actually call. This is a read-only query; it does not change how
+        findings are submitted/deduplicated (EvidenceEngine.submit_finding
+        is unaffected).
+        """
+        clauses = []
+        params: list = []
+        if experiment_id is not None:
+            clauses.append("experiment_id = ?")
+            params.append(experiment_id)
+        if offset_range is not None:
+            start, end = offset_range
+            clauses.append("offset < ? AND (offset + COALESCE(size, 0)) >= ?")
+            params.extend([end, start])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = self._conn.execute(f"SELECT finding_id FROM findings {where} ORDER BY offset", params)
+        return [self.get_finding(row["finding_id"]) for row in cursor.fetchall()]
+
+    def query_evidences(
+        self,
+        experiment_id: Optional[str] = None,
+        offset_range: Optional[tuple] = None,
+    ) -> List[Evidence]:
+        """Query persisted evidence, optionally filtered by experiment_id
+        and/or an [start, end) source_offset range (same overlap semantics
+        as query_findings; evidence with source_offset=None is excluded
+        from offset_range-filtered queries since it has no location to
+        match against). See query_findings docstring for context."""
+        clauses = []
+        params: list = []
+        if experiment_id is not None:
+            clauses.append("experiment_id = ?")
+            params.append(experiment_id)
+        if offset_range is not None:
+            start, end = offset_range
+            clauses.append(
+                "source_offset IS NOT NULL AND source_offset < ? "
+                "AND (source_offset + COALESCE(source_size, 0)) >= ?"
+            )
+            params.extend([end, start])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cursor = self._conn.execute(
+            f"SELECT * FROM evidences {where} ORDER BY source_offset", params
+        )
+        return [
+            Evidence(
+                evidence_id=row["evidence_id"],
+                experiment_id=row["experiment_id"],
+                evidence_type=EvidenceType(row["evidence_type"]),
+                confidence=ConfidenceLevel[row["confidence"]],
+                description=row["description"],
+                data=json.loads(row["data_json"]),
+                source_offset=row["source_offset"],
+                source_size=row["source_size"],
+                tags=json.loads(row["tags_json"]),
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
     # --- Finding Operations ---
 
     def store_finding(self, finding: Finding) -> None:

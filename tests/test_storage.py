@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from mtklab.core.evidence import ConfidenceLevel, Evidence, EvidenceType, Finding, FindingKind
-from mtklab.core.experiment import ExperimentResult
+from mtklab.core.experiment import ExperimentContext, ExperimentResult
 from mtklab.core.hypothesis import Hypothesis, HypothesisStatus
 from mtklab.storage.db import EvidenceDatabase
 from mtklab.storage.migrations import MigrationManager
@@ -825,6 +825,143 @@ class TestRunTracking(unittest.TestCase):
                 {"experiment_run_id", "run_id", "experiment_id", "status",
                  "error_message", "duration_seconds", "metrics_json", "created_at"},
             )
+        finally:
+            db.close()
+
+
+class TestQueryFindingsAndEvidences(unittest.TestCase):
+    """Tests for query_findings()/query_evidences() (db.py) and
+    ExperimentContext.get_findings()/get_evidences() -- implements the
+    ctx.get_findings()/ctx.get_evidences() capability documented in
+    docs/architecture/DOMAIN_API.md section 5 but not previously built.
+    This is what makes the corroboration scenario representable: an
+    experiment checking whether an offset it's investigating was already
+    reported by another experiment."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_query.db"
+        self.migrations_dir = Path(__file__).parent.parent / "src" / "mtklab" / "storage" / "migrations"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _create_sample_experiment(self, db: EvidenceDatabase, exp_id: str):
+        res = ExperimentResult(experiment_id=exp_id, status="success", summary="sample")
+        res.mark_completed()
+        db.store_experiment_result(res)
+
+    def test_query_findings_filters_by_experiment_id(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self._create_sample_experiment(db, "expA")
+            self._create_sample_experiment(db, "expB")
+            fa = Finding(experiment_id="expA", kind=FindingKind.REGION, offset=0x100, size=16)
+            fb = Finding(experiment_id="expB", kind=FindingKind.REGION, offset=0x200, size=16)
+            db.store_finding(fa)
+            db.store_finding(fb)
+
+            results = db.query_findings(experiment_id="expA")
+            self.assertEqual([f.finding_id for f in results], [fa.finding_id])
+        finally:
+            db.close()
+
+    def test_query_findings_filters_by_offset_range_overlap(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self._create_sample_experiment(db, "expA")
+            inside = Finding(experiment_id="expA", kind=FindingKind.REGION, offset=0x5940, size=32)  # 0x5940-0x5960
+            outside = Finding(experiment_id="expA", kind=FindingKind.REGION, offset=0x9000, size=32)
+            db.store_finding(inside)
+            db.store_finding(outside)
+
+            # Query window [0x5900, 0x5A00) -- overlaps `inside`, not `outside`.
+            results = db.query_findings(offset_range=(0x5900, 0x5A00))
+            self.assertEqual([f.finding_id for f in results], [inside.finding_id])
+        finally:
+            db.close()
+
+    def test_query_evidences_filters_by_offset_range_overlap(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self._create_sample_experiment(db, "expA")
+            near = Evidence(experiment_id="expA", evidence_type=EvidenceType.OFFSET_REFERENCE,
+                             source_offset=0x5950, source_size=2, data={"where": "near"})
+            far = Evidence(experiment_id="expA", evidence_type=EvidenceType.OFFSET_REFERENCE,
+                            source_offset=0x20000, source_size=2, data={"where": "far"})
+            db.store_evidence(near)
+            db.store_evidence(far)
+
+            results = db.query_evidences(offset_range=(0x5900, 0x5A00))
+            self.assertEqual([e.evidence_id for e in results], [near.evidence_id])
+        finally:
+            db.close()
+
+    def test_evidence_with_no_source_offset_excluded_from_range_query(self):
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self._create_sample_experiment(db, "expA")
+            no_offset = Evidence(experiment_id="expA", evidence_type=EvidenceType.MANUAL_ANNOTATION,
+                                  data={"no": "offset"})
+            db.store_evidence(no_offset)
+
+            results = db.query_evidences(offset_range=(0, 0x1000000))
+            self.assertEqual(results, [])
+            # But an unscoped query still returns it.
+            self.assertEqual(len(db.query_evidences()), 1)
+        finally:
+            db.close()
+
+    def test_corroboration_scenario_end_to_end(self):
+        """Represents the exact scenario from the architecture review:
+        experiment A finds a raw candidate at an offset; experiment C
+        (independently, later) checks the area around that offset via
+        ctx.get_findings()/get_evidences() and can see A's candidate to
+        decide whether it corroborates its own observation. This does NOT
+        auto-escalate confidence (no such mechanism is claimed to exist
+        here) -- it demonstrates that the DATA needed to make that
+        judgement call is now actually queryable, which it was not before
+        this change (ctx.get_findings()/get_evidences() did not exist)."""
+        db = EvidenceDatabase(self.db_path, self.migrations_dir)
+        try:
+            self._create_sample_experiment(db, "expA")
+            self._create_sample_experiment(db, "expC")
+
+            # Experiment A: raw candidate byte-sequence match, CANDIDATE
+            # confidence -- explicitly not treated as a confirmed structure.
+            candidate_evidence = Evidence(
+                experiment_id="expA", evidence_type=EvidenceType.SIGNATURE_MATCH,
+                confidence=ConfidenceLevel.CANDIDATE,
+                description="Byte sequence 09 60 found (candidate for 0x6009)",
+                source_offset=0x5950, source_size=2, data={"bytes": "0960"},
+            )
+            candidate_finding = Finding(
+                experiment_id="expA", kind=FindingKind.UNKNOWN, offset=0x5950, size=2,
+                confidence=ConfidenceLevel.CANDIDATE, label="Candidate byte match",
+                evidence_ids=[candidate_evidence.evidence_id],
+            )
+            db.store_evidence(candidate_evidence)
+            db.store_finding(candidate_finding)
+            db.link_finding_evidences(candidate_finding.finding_id, [candidate_evidence.evidence_id])
+
+            ctx = ExperimentContext(
+                firmware_path=Path("/dev/null"), ree_payload_path=Path("/dev/null"),
+                config={}, evidence_db=db, artifacts_dir=Path(self.temp_dir.name),
+            )
+
+            # Experiment C, independently, checks what's already known
+            # near the offset it's currently investigating.
+            nearby_findings = ctx.get_findings(near_offset=0x5950, radius=16)
+            nearby_evidence = ctx.get_evidences(near_offset=0x5950, radius=16)
+
+            self.assertEqual(len(nearby_findings), 1)
+            self.assertEqual(nearby_findings[0].finding_id, candidate_finding.finding_id)
+            self.assertEqual(nearby_findings[0].confidence, ConfidenceLevel.CANDIDATE)
+            self.assertEqual(len(nearby_evidence), 1)
+            self.assertEqual(nearby_evidence[0].description, candidate_evidence.description)
+
+            # A search far away must not see it.
+            self.assertEqual(ctx.get_findings(near_offset=0x50000, radius=16), [])
         finally:
             db.close()
 

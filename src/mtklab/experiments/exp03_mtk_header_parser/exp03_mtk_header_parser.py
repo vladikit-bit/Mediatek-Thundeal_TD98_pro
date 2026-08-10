@@ -185,6 +185,7 @@ class Exp03MtkHeaderParser(Experiment):
                 + (" (magic confirmed)" if has_magic else " (magic NOT found)")
                 + f", {len(anchor_matches)} candidate field(s) matched"
             ),
+            evidence_ids=[e.evidence_id for e in evidences],
             metadata={
                 "magic_found": has_magic,
                 "magic_bytes": magic.decode("ascii", errors="replace"),

@@ -189,5 +189,122 @@ class TestCLIStatusAndInspect(unittest.TestCase):
             self.assertIn("No experiment, logical_id, or finding_id", result.output)
 
 
+class TestEvidenceFindingAttribution(unittest.TestCase):
+    """Regression tests for a confirmed bug found during architecture
+    review: `run`'s submission loop used to pass the FULL result.evidences
+    list to submit_finding() for EVERY finding, so an experiment emitting
+    multiple distinct findings in one run (e.g. exp02, one per detected
+    table) had every finding incorrectly cross-linked to every OTHER
+    finding's evidence too. Fixed by scoping submitted evidence to each
+    finding via finding.evidence_ids (now populated by experiments at
+    construction time) -- see cli.py's `run` command and
+    docs/architecture/DOMAIN_API.md section 4/5, which already documented
+    evidence as being specific to the finding it's submitted with.
+    """
+
+    def setUp(self):
+        self.runner = CliRunner()
+
+    def test_two_findings_in_one_run_get_distinct_evidence_not_cross_linked(self):
+        import mtklab.experiments.exp00_dummy.exp00_dummy as exp00_mod
+        from mtklab.core.experiment import ExperimentResult
+        from mtklab.core.evidence import Evidence, EvidenceType, ConfidenceLevel, Finding, FindingKind
+
+        def fake_run(self, ctx):
+            ev_a = Evidence(
+                experiment_id=self.experiment_id, evidence_type=EvidenceType.MANUAL_ANNOTATION,
+                confidence=ConfidenceLevel.CANDIDATE, description="Evidence A",
+                source_offset=0x1000, source_size=16, data={"which": "A"},
+            )
+            ev_b = Evidence(
+                experiment_id=self.experiment_id, evidence_type=EvidenceType.MANUAL_ANNOTATION,
+                confidence=ConfidenceLevel.CANDIDATE, description="Evidence B",
+                source_offset=0x9000, source_size=16, data={"which": "B"},
+            )
+            finding_a = Finding(
+                experiment_id=self.experiment_id, kind=FindingKind.REGION, offset=0x1000, size=16,
+                label="Finding A", evidence_ids=[ev_a.evidence_id],
+            )
+            finding_b = Finding(
+                experiment_id=self.experiment_id, kind=FindingKind.REGION, offset=0x9000, size=16,
+                label="Finding B", evidence_ids=[ev_b.evidence_id],
+            )
+            return ExperimentResult(
+                experiment_id=self.experiment_id, status="success", summary="two findings",
+                findings=[finding_a, finding_b], evidences=[ev_a, ev_b],
+            )
+
+        original_run = exp00_mod.Exp00Dummy.run
+        exp00_mod.Exp00Dummy.run = fake_run
+        try:
+            with self.runner.isolated_filesystem():
+                self.runner.invoke(cli, ["init-project", "proj"])
+                result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
+                self.assertEqual(result.exit_code, 0, result.output)
+
+                import sqlite3
+                conn = sqlite3.connect("data/projects/proj/evidence.db")
+                conn.row_factory = sqlite3.Row
+
+                findings = conn.execute("SELECT finding_id, offset FROM findings ORDER BY offset").fetchall()
+                self.assertEqual(len(findings), 2)
+                finding_at_1000 = next(f for f in findings if f["offset"] == 0x1000)
+                finding_at_9000 = next(f for f in findings if f["offset"] == 0x9000)
+
+                linked_to_1000 = conn.execute(
+                    "SELECT e.description FROM evidences e "
+                    "JOIN finding_evidences fe ON fe.evidence_id = e.evidence_id "
+                    "WHERE fe.finding_id = ?",
+                    (finding_at_1000["finding_id"],),
+                ).fetchall()
+                linked_to_9000 = conn.execute(
+                    "SELECT e.description FROM evidences e "
+                    "JOIN finding_evidences fe ON fe.evidence_id = e.evidence_id "
+                    "WHERE fe.finding_id = ?",
+                    (finding_at_9000["finding_id"],),
+                ).fetchall()
+                conn.close()
+
+                self.assertEqual([r["description"] for r in linked_to_1000], ["Evidence A"])
+                self.assertEqual([r["description"] for r in linked_to_9000], ["Evidence B"])
+        finally:
+            exp00_mod.Exp00Dummy.run = original_run
+
+    def test_evidence_with_no_associated_finding_is_still_persisted(self):
+        """An experiment can legitimately produce evidence that doesn't
+        (yet) support any specific finding -- it must still be stored
+        (for provenance/future corroboration), just left unlinked."""
+        import mtklab.experiments.exp00_dummy.exp00_dummy as exp00_mod
+        from mtklab.core.experiment import ExperimentResult
+        from mtklab.core.evidence import Evidence, EvidenceType, ConfidenceLevel
+
+        def fake_run(self, ctx):
+            orphan = Evidence(
+                experiment_id=self.experiment_id, evidence_type=EvidenceType.MANUAL_ANNOTATION,
+                confidence=ConfidenceLevel.CANDIDATE, description="Orphan evidence",
+                source_offset=0x2000, source_size=16, data={"orphan": True},
+            )
+            return ExperimentResult(
+                experiment_id=self.experiment_id, status="success", summary="orphan evidence only",
+                findings=[], evidences=[orphan],
+            )
+
+        original_run = exp00_mod.Exp00Dummy.run
+        exp00_mod.Exp00Dummy.run = fake_run
+        try:
+            with self.runner.isolated_filesystem():
+                self.runner.invoke(cli, ["init-project", "proj"])
+                result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
+                self.assertEqual(result.exit_code, 0, result.output)
+
+                import sqlite3
+                conn = sqlite3.connect("data/projects/proj/evidence.db")
+                rows = conn.execute("SELECT description FROM evidences").fetchall()
+                conn.close()
+                self.assertEqual([r[0] for r in rows], ["Orphan evidence"])
+        finally:
+            exp00_mod.Exp00Dummy.run = original_run
+
+
 if __name__ == "__main__":
     unittest.main()

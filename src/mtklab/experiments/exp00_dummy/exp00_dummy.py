@@ -55,6 +55,15 @@ class Exp00Dummy(Experiment):
                 tags=["test", "dummy"],
             )
             evidences.append(evidence)
+
+            # Associate the evidence with the finding it actually supports.
+            # Without this, cli.py's submission loop (which now scopes
+            # evidence per finding via finding.evidence_ids) would link no
+            # evidence at all to this finding -- and previously, before
+            # that fix, EVERY finding across an entire multi-finding
+            # ExperimentResult would incorrectly get linked to ALL
+            # evidence from the whole run, not just its own.
+            finding.evidence_ids.append(evidence.evidence_id)
         
         # Create a test artifact
         artifact_path = ctx.artifacts_dir / "exp00_dummy.json"

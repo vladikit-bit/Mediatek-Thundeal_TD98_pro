@@ -20,6 +20,7 @@ REE_OFFSET_LEN, or a config typo).
 
 from mtklab.experiments import Experiment, ExperimentContext, ExperimentResult
 from mtklab.core.evidence import Evidence, EvidenceType, ConfidenceLevel, Finding, FindingKind
+import re
 
 
 class Exp04TextHeaderParser(Experiment):
@@ -145,6 +146,7 @@ class Exp04TextHeaderParser(Experiment):
                 f"ASCII KEY=VALUE header at 0x{header_offset:X}: {len(pairs)} pair(s) parsed"
                 + (f", {len(mismatches)} mismatch(es) vs. configured hints" if mismatches else "")
             ),
+            evidence_ids=[e.evidence_id for e in evidences],
             metadata={
                 "raw_text": text,
                 "parsed_pairs": {k: hex(v) for k, v in pairs.items()},
@@ -175,23 +177,31 @@ class Exp04TextHeaderParser(Experiment):
         )
 
     def _parse_key_value_pairs(self, text: str) -> dict[str, int]:
-        """Parse a comma-separated ASCII "KEY=VALUE" header into a dict of
-        key -> int. Tolerant of malformed segments (skipped, not fatal):
-        this is unverified free-text firmware metadata, not a rigid schema,
-        so a stray/garbled segment should not prevent parsing the rest.
-        Values are parsed with base auto-detection (int(x, 0)), so both
-        "0x1000" and plain decimal values are accepted.
+        """Parse "KEY = VALUE" declarations found anywhere in the text.
+
+        IMPORTANT (found during real-firmware review): the original
+        version of this parser assumed a specific delimiter style
+        ("KEY=VALUE, KEY2=VALUE2", comma-separated, no spaces around "=")
+        based on the wording in config/firmware.yaml. The real OTA image
+        instead contains:
+
+            # REE_OFFSET_START = 0x1000 #
+            # REE_OFFSET_LEN = 0x5aeb0000 #
+
+        i.e. spaces around "=", each declaration wrapped in "#", and
+        (presumably) newline-separated rather than comma-separated. Rather
+        than hardcoding this one now-observed format either -- which would
+        just be trading one unverified assumption for another, and the
+        exact separator between declarations still isn't confirmed byte-
+        for-byte -- this searches for the one thing common to both the
+        originally-assumed format and the real one: a bare "KEY = VALUE"
+        token, regardless of surrounding punctuation or whitespace style.
+        This is a strict generalization (a superset of both), not a new
+        guess about formatting.
         """
         pairs: dict[str, int] = {}
-        for segment in text.split(","):
-            segment = segment.strip()
-            if "=" not in segment:
-                continue
-            key, _, value_str = segment.partition("=")
-            key = key.strip()
-            value_str = value_str.strip()
-            if not key or not value_str:
-                continue
+        for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f]+|\d+)", text):
+            key, value_str = match.group(1), match.group(2)
             try:
                 pairs[key] = int(value_str, 0)
             except ValueError:
