@@ -11,6 +11,81 @@ from click.testing import CliRunner
 from mtklab.cli import cli
 
 
+class TestExperimentParametersProvenance(unittest.TestCase):
+    """Regression tests for a confirmed provenance bug found during
+    architecture review: db.py's store_experiment_result() has always
+    written json.dumps(getattr(result, "parameters", {})) into the
+    experiments table's parameters_json column, but ExperimentResult never
+    actually had a `parameters` attribute -- so that column was empty for
+    every experiment run in the project's history. Fixed by adding the
+    field to ExperimentResult and having cli.py's `run` command populate
+    it uniformly from exp.parameters after every return path.
+
+    Known limitation (documented, not fixed here): the experiments table
+    is keyed by experiment_id and overwritten each run, so this reflects
+    only the most recent run's parameters, not necessarily the exact
+    parameters active when a specific already-persisted Finding/Evidence
+    was originally created. True per-observation provenance would need a
+    parameters column on the per-invocation experiment_runs table instead.
+    """
+
+    def setUp(self):
+        self.runner = CliRunner()
+
+    def _query_parameters(self, db_path: str, experiment_id: str) -> dict:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT parameters_json FROM experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        conn.close()
+        return json.loads(row[0])
+
+    def test_successful_run_captures_actual_parameters(self):
+        with self.runner.isolated_filesystem():
+            self.runner.invoke(cli, ["init-project", "proj"])
+            result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
+            self.assertEqual(result.exit_code, 0, result.output)
+
+            params = self._query_parameters("data/projects/proj/evidence.db", "exp00_dummy")
+            # Must be the REAL parameters dict, not the old always-empty {}.
+            self.assertNotEqual(params, {})
+            self.assertIn("sleep_seconds", params)
+            self.assertIn("create_finding", params)
+
+    def test_clean_failure_path_also_captures_parameters(self):
+        """The 'failed' ExperimentResult returned without raising (e.g.
+        exp01's 'REE payload not found') must also get parameters -- not
+        just the success path."""
+        with self.runner.isolated_filesystem():
+            self.runner.invoke(cli, ["init-project", "proj"])
+            result = self.runner.invoke(cli, ["run", "--project", "proj", "exp01_entropy_landscape"])
+            self.assertEqual(result.exit_code, 0, result.output)
+
+            params = self._query_parameters("data/projects/proj/evidence.db", "exp01_entropy_landscape")
+            self.assertNotEqual(params, {})
+
+    def test_raised_exception_path_also_captures_parameters(self):
+        import mtklab.experiments.exp00_dummy.exp00_dummy as exp00_mod
+
+        def boom(self, ctx):
+            raise RuntimeError("synthetic failure")
+
+        original_run = exp00_mod.Exp00Dummy.run
+        exp00_mod.Exp00Dummy.run = boom
+        try:
+            with self.runner.isolated_filesystem():
+                self.runner.invoke(cli, ["init-project", "proj"])
+                result = self.runner.invoke(cli, ["run", "--project", "proj", "exp00_dummy"])
+                self.assertEqual(result.exit_code, 0, result.output)
+
+                params = self._query_parameters("data/projects/proj/evidence.db", "exp00_dummy")
+                self.assertNotEqual(params, {})
+                self.assertIn("sleep_seconds", params)
+        finally:
+            exp00_mod.Exp00Dummy.run = original_run
+
+
 class TestCLIRunTracking(unittest.TestCase):
     """MTKLAB-010: `mtklab run` creates runs/experiment_runs records."""
 

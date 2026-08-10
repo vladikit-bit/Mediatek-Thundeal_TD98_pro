@@ -344,6 +344,12 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
             # Run experiment
             result = exp.run(ctx)
             result.mark_completed()
+            # Provenance (architecture review finding): capture the exact
+            # parameters this run used, uniformly for every experiment and
+            # every return path, rather than requiring each experiment to
+            # set this itself. dict(...) copies rather than aliases
+            # exp.parameters, which is normally a shared class-level dict.
+            result.parameters = dict(exp.parameters)
             duration = time.time() - start_time
             
             # Store experiment result first so foreign keys reference a valid experiment row
@@ -433,6 +439,7 @@ def run(project: str, experiment_ids: tuple, run_all: bool, dry_run: bool):
                 status="failed",
                 summary=str(e),
                 errors=[str(e)],
+                parameters=dict(exp.parameters),
             )
             failed_result.mark_completed()
             proj.db.store_experiment_result(failed_result)

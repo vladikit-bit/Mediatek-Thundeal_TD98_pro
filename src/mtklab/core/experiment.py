@@ -84,6 +84,27 @@ class ExperimentResult:
     errors: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=datetime.utcnow)
     completed_at: datetime | None = None
+    # Snapshot of the experiment's self.parameters at the time it ran
+    # (provenance gap found during architecture review: db.py's
+    # store_experiment_result() has always written
+    # json.dumps(getattr(result, "parameters", {})) into the experiments
+    # table's parameters_json column, but ExperimentResult never actually
+    # had a `parameters` attribute -- so that column has always been
+    # empty, for every run, ever. Populated by cli.py's `run` command
+    # (result.parameters = dict(exp.parameters)) right after exp.run(ctx)
+    # returns, uniformly for every experiment regardless of which return
+    # path it took, rather than requiring every experiment to set this
+    # itself on every return statement.
+    #
+    # KNOWN LIMITATION (flagged, not fixed here): the experiments table is
+    # keyed by experiment_id and overwritten on each run (INSERT OR
+    # REPLACE), so this only ever reflects the MOST RECENT run's
+    # parameters, not the exact parameters active when a specific
+    # already-persisted Finding/Evidence was originally created. True
+    # per-observation parameter provenance would need its own column on
+    # the per-invocation experiment_runs table (MTKLAB-009/010) instead,
+    # which needs a schema migration and is left for a follow-up.
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     def mark_completed(self):
         self.completed_at = datetime.utcnow()
